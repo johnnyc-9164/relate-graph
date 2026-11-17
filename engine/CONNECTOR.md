@@ -180,6 +180,10 @@ Mechanical graph operations are fixed code with typed inputs and a single JSON o
 ~/workspace/relate-space/ensure-api.sh
 ```
 
+(ensure-api.sh delegates to `~/workspace/relate-space/ensure-all.sh`, the canonical heal: it reinstalls both systemd units from the workspace copies, enables and starts every registered graph service, starts the Ollama embedding runtime if down, and verifies every API with a live count query.)
+
+- A VM replacement can wipe the systemd units under /etc. This is now self-healing: the `relate-api-watch` hook polls every registered graph API every 15 seconds and runs ensure-all.sh itself when any is down, waking an agent only when a heal fails. Proven 2026-11-17 with a simulated wipe (all services stopped, units deleted, Ollama killed): the hook restored everything unattended in ~10 seconds with counts exact. The canonical unit copies also enable under `default.target` — the target this guest actually boots — as well as `multi-user.target`.
+
 - When another graph's API cannot be reached, start its service once and then retry:
 
 ```text
