@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""relate-search — hybrid search over a Relate graph (companion to bin/relate).
+
+Three retrieval legs fused with reciprocal-rank fusion (RRF, k=60),
+Graphiti-style:
+  1. VECTOR    — query embedded with embeddinggemma-2 (local Ollama, task-
+                 prefixed); RAW cosine against stored node vectors.
+                 Native mode (graph carries the DDL): the engine's exact
+                 vector index scan via db.index.vector.queryNodes, with
+                 the rebounded score converted back (raw = 2*score - 1).
+                 Fallback (no index): Python cosine over fetched vectors.
+  2. KEYWORD   — native mode: the engine FULLTEXT index
+                 (db.index.fulltext.queryNodes over name/summary/alias/
+                 legalName/normalizedName). Fallback: weighted substring
+                 match over the same fields, in Python.
+  3. TRAVERSAL — one-hop content neighbors of the vector+keyword seeds,
+                 ranked by how many seeds they touch.
+
+Deterministic: same query + same graph state = same output. All rankings
+tie-break by slug ascending. Read-only: this tool never writes to a graph.
+
+With --rerank, the top 25 fused results are re-scored by a fixed feature
+computation (rawCosine / termCoverage / phraseBonus / traversalSupport /
+completeness — see RERANK_WEIGHTS below and relate-search-notes.md) and
+re-sorted before --limit applies. No LLM judgment anywhere in the rerank:
+same features in, same order out.
+
+With --questions, a separate questions leg reads the stored (:Question)
+nodes (each stored by the answering loop with its embedding and
+lead-grade ABOUT edges to the nodes its answer stood on) and returns the
+matching ones in a top-level "priorQuestions" section — question text,
+when asked, and the ABOUT target slugs — so a repeated question
+retrieves what the last answer stood on. Questions are never content:
+they stay out of the fused ranking, the counts, and the rerank pool,
+and without the flag the output is unchanged byte for byte.
+
+Usage: relate-search <graph-slug> "<query text>" [--limit N] [--rerank]
+       [--triplets] [--questions]
+Exit codes mirror bin/relate: 0 ok, 1 API failure, 2 usage/unknown graph.
+"""
+
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+REGISTRY_PATH = os.path.expanduser("~/workspace/relate-space/graphs/registry.json")
+OLLAMA_BIN = os.path.expanduser("~/workspace/relate-runtime/ollama/bin/ollama")
+OLLAMA_MODELS = os.path.expanduser("~/workspace/relate-runtime/models")
+OLLAMA_MODEL = "embeddinggemma-2"
+# EmbeddingGemma 2 asymmetric retrieval contract (model card): queries are
+# embedded with the search-result task prefix; corpus nodes were embedded
+# by bin/relate in the matching document format (title: … | text: …).
+QUERY_PREFIX = "task: search result | query: "
+
+# Labels that are graph bookkeeping, never search content. Decision and
+# ReviewItem joined the set 2026-11-16: Main now carries slugged Decision
+# nodes (decision-0001, decision-0002 — the phase-4 decision ledger) that a
+# "decision" query would otherwise surface via the keyword leg. They have
+# no edges, so excluding them cannot perturb any other node's ranks.
+# Question joined 2026-11-17: stored questions ARE a retrieval surface,
+# but their own one (the --questions leg below), never fused content —
+# left in this set's complement they would surface as pseudo-entities
+# (their summary IS a question string) and their ABOUT edges would bend
+# the traversal leg's counts.
+BOOKKEEPING_LABELS = {"Ontology", "OntologyClass", "OntologyProperty",
+                      "SpaceSignal", "Decision", "ReviewItem", "Question"}
+
+# Keyword leg: fixed field weights (per query-term substring hit).
+FIELD_WEIGHTS = [
+    ("name", 5),
+    ("slug", 4),
+    ("alias", 4),
+    ("legalName", 4),
+    ("normalizedName", 4),
+    ("category", 2),
+    ("summary", 1),
+]
+PHRASE_BONUS = [("name", 5), ("summary", 2)]  # full multi-term query as substring
+
+# Vector leg: minimum RAW cosine for a node to count as a vector candidate.
+# Recalibrated on Main (2026-11-17) for EmbeddingGemma 2 with task prefixes
+# (prefixed query vs document-format corpus): true matches 0.70-0.78 across
+# 6 probes, best nonsense top score 0.6688 across 5 probes, corpus median
+# ~0.56-0.61 — v2's distribution is compressed, so the gate sits in the
+# measured empty band (0.6688, 0.7005). (v1 calibration was 0.25.)
+VECTOR_MIN_COSINE = 0.68
+
+RRF_K = 60
+
+# Rerank stage (--rerank): pool size and the fixed feature weights.
+# rerankScore = 0.45*rawCosine + 0.25*termCoverage + 0.15*phraseBonus
+#             + 0.10*traversalSupport + 0.05*completeness   (all features 0..1)
+RERANK_POOL = 25
+RERANK_WEIGHTS = {
+    "rawCosine": 0.45,
+    "termCoverage": 0.25,
+    "phraseBonus": 0.15,
+    "traversalSupport": 0.10,
+    "completeness": 0.05,
+}
+
+
+def fail(code, message):
+    print(json.dumps({"error": message}), file=sys.stderr)
+    sys.exit(code)
+
+
+def http_json(url, payload=None, timeout=120):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"},
+        method="POST" if data is not None else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def resolve_graph(slug):
+    try:
+        with open(REGISTRY_PATH) as fh:
+            registry = json.load(fh)
+    except OSError as exc:
+        fail(1, f"cannot read graph registry {REGISTRY_PATH}: {exc}")
+    graphs = registry.get("graphs", [])
+    for graph in graphs:
+        if graph.get("slug") == slug:
+            return graph
+    valid = ", ".join(sorted(g.get("slug", "?") for g in graphs))
+    fail(2, f"unknown graph '{slug}' (valid: {valid})")
+
+
+def relate_query(api_base, statement, parameters=None):
+    try:
+        result = http_json(f"{api_base}/db/neo4j/query/v2",
+                           {"statement": statement,
+                            "parameters": parameters or {}})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        fail(1, f"Relate API failure at {api_base}: {exc}")
+    if not isinstance(result, dict) or "data" not in result:
+        fail(1, f"Relate API failure at {api_base}: unexpected response {result!r}")
+    return result["data"]["values"]
+
+
+def ollama_base():
+    host = os.environ.get("OLLAMA_HOST", "").strip()
+    if host:
+        return host if "://" in host else f"http://{host}"
+    return "http://127.0.0.1:11434"
+
+
+def ollama_up(base):
+    try:
+        http_json(f"{base}/api/tags", timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_ollama(base):
+    if ollama_up(base):
+        return
+    env = dict(os.environ, OLLAMA_MODELS=OLLAMA_MODELS)
+    try:
+        subprocess.Popen([OLLAMA_BIN, "serve"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as exc:
+        fail(1, f"Ollama unreachable at {base} and relaunch failed: {exc}")
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        if ollama_up(base):
+            return
+        time.sleep(1)
+    fail(1, f"Ollama unreachable at {base} (relaunched, still down after 45s)")
+
+
+def embed_query(base, text, prefix=QUERY_PREFIX):
+    try:
+        result = http_json(f"{base}/api/embeddings",
+                           {"model": OLLAMA_MODEL, "prompt": prefix + text})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        fail(1, f"Ollama embeddings failure at {base}: {exc}")
+    vector = result.get("embedding") if isinstance(result, dict) else None
+    if not isinstance(vector, list) or not vector:
+        fail(1, f"Ollama embeddings failure at {base}: no embedding in response")
+    return [float(x) for x in vector]
+
+
+# Edge fact sentences are embedded by bin/relate in the symmetric
+# sentence-similarity format (marker eg2-sym-v1); a query compared
+# against them is embedded in the same format (format-matched
+# comparison, the EmbeddingGemma 2 contract).
+SYM_PREFIX = "task: sentence similarity | query: "
+
+# Triplet mode (--triplets): the retrieved unit is the FACT, not the
+# node (Cognee GRAPH_COMPLETION). Score = fixed combination of the
+# fact-sentence similarity, the endpoint similarities, and a structure
+# term (endpoints among the search seeds), times a memify weight
+# factor that is neutral (1.0) at the default weights of 0.5.
+TRIPLET_WEIGHTS = {"fact": 0.40, "endpointMax": 0.30,
+                   "endpointMean": 0.20, "structure": 0.10}
+TRIPLET_FACT_GATE = 0.60
+
+
+def raw_cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+USAGE = 'usage: relate-search <graph-slug> "<query text>" [--limit N] [--rerank] [--triplets] [--questions]'
+
+
+def _field_text(value):
+    """Searchable text for a node field: strings pass through, lists join.
+
+    A merged node's alias is a LIST of absorbed slugs/names; skipping
+    non-string values made merged nodes unfindable by those aliases."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(str(v) for v in value)
+    return None
+
+
+def rerank_features(node, query, terms, cosine, support, max_support):
+    """The five deterministic rerank features for one candidate (each 0..1).
+
+    termCoverage: per query term, 1.0 if the term substring-hits any
+    identity field (name/slug/alias/legalName/normalizedName), else 0.5
+    if it hits summary, else 0; averaged over the terms (0 when the query
+    yields no terms). phraseBonus: 1 if the full query string appears in
+    name, else 0.5 if in summary, else 0. traversalSupport: distinct seed
+    nodes adjacent to this candidate (the traversal leg's count — a seed
+    counts only OTHER seeds, adjacency has no self-loops) divided by the
+    max count over the rerank pool. completeness: fraction of {summary
+    non-empty, embedding present, category non-empty} that hold.
+    """
+    identity = []
+    for f in ("name", "slug", "alias", "legalName", "normalizedName"):
+        text = _field_text(node.get(f))
+        if text:
+            identity.append(text.lower())
+    summary = node.get("summary")
+    summary_l = summary.lower() if isinstance(summary, str) else ""
+    if terms:
+        covered = 0.0
+        for term in terms:
+            if any(term in text for text in identity):
+                covered += 1.0
+            elif term in summary_l:
+                covered += 0.5
+        term_coverage = covered / len(terms)
+    else:
+        term_coverage = 0.0
+    phrase = query.strip().lower()
+    name_l = node["name"].lower() if isinstance(node.get("name"), str) else ""
+    if phrase and phrase in name_l:
+        phrase_bonus = 1.0
+    elif phrase and phrase in summary_l:
+        phrase_bonus = 0.5
+    else:
+        phrase_bonus = 0.0
+    traversal_support = (support / max_support) if max_support else 0.0
+    completeness = sum((
+        isinstance(summary, str) and bool(summary.strip()),
+        bool(node.get("embedded")),
+        isinstance(node.get("category"), str) and bool(node["category"].strip()),
+    )) / 3.0
+    return {
+        "rawCosine": cosine,
+        "termCoverage": term_coverage,
+        "phraseBonus": phrase_bonus,
+        "traversalSupport": traversal_support,
+        "completeness": completeness,
+    }
+
+
+# Questions leg (--questions): stored (:Question) nodes as a retrieval
+# surface. The answering loop stores every answered question with its
+# embedding and lead-grade ABOUT edges to the nodes the answer stood on;
+# a later paraphrase of the same question should surface that record so
+# the next answer starts from the same evidence. Two sub-legs fused with
+# the same RRF (k=60) as the content legs:
+#   vector  — RAW cosine of the incoming query vector (embedded with the
+#             same QUERY_PREFIX the stored questions were embedded
+#             under) against each stored question vector, gated at the
+#             content leg's VECTOR_MIN_COSINE. There is no native vector
+#             index for the Question label (the DDL gives it a slug
+#             constraint only), so this sub-leg is Python by design;
+#             stored-question counts are small.
+#   keyword — fixed-weight substring match over the question text
+#             (the `text` property, falling back to `summary` — the
+#             storage mechanics set both to the question string).
+# The leg is behind --questions, default off, on purpose: folded into
+# the fused ranking, a stored question could outrank the very entity it
+# asks about and would change the results list existing consumers read.
+# As its own section it cannot perturb results, counts, or the rerank
+# pool — default output stays byte-identical.
+QUESTION_TEXT_WEIGHT = 5    # per query-term hit in the question text
+QUESTION_PHRASE_BONUS = 5   # full multi-term query verbatim in the text
+
+
+def question_leg(api_base, query, terms, query_vector, limit):
+    """Ranked stored questions matching this query.
+
+    Returns (entries, total_candidates) with entries capped at limit;
+    each entry is {slug, text, askedAt, score, cosine, legs, about},
+    where `about` lists the stored answer's ABOUT targets in slug
+    order. Deterministic: every ranking tie-breaks by slug ascending.
+    Any Relate failure exits 1 via relate_query — no silent degradation.
+    """
+    rows = relate_query(
+        api_base,
+        "MATCH (q:Question) WHERE q.slug IS NOT NULL "
+        "RETURN q.slug, q.text, q.summary, q.askedAt, q.embedding")
+    about_rows = relate_query(
+        api_base,
+        "MATCH (q:Question)-[:ABOUT]->(t) "
+        "WHERE q.slug IS NOT NULL AND t.slug IS NOT NULL "
+        "RETURN q.slug, t.slug, t.name, labels(t)[0] "
+        "ORDER BY q.slug, t.slug")
+    about = {}
+    for q_slug, t_slug, t_name, t_label in about_rows:
+        about.setdefault(q_slug, []).append(
+            {"slug": t_slug, "name": t_name or t_slug, "label": t_label})
+    cosines = {}
+    keyword_scores = {}
+    texts = {}
+    asked = {}
+    phrase = query.strip().lower()
+    for q_slug, text, summary, asked_at, vector in rows:
+        body = text if isinstance(text, str) and text else summary
+        texts[q_slug] = body
+        asked[q_slug] = asked_at
+        if isinstance(vector, list) and len(vector) == len(query_vector):
+            cos = raw_cosine(query_vector, [float(x) for x in vector])
+            if cos >= VECTOR_MIN_COSINE:
+                cosines[q_slug] = cos
+        if isinstance(body, str) and terms:
+            lowered = body.lower()
+            hits = sum(1 for t in terms if t in lowered)
+            score = QUESTION_TEXT_WEIGHT * hits
+            if len(terms) > 1 and phrase and phrase in lowered:
+                score += QUESTION_PHRASE_BONUS
+            if score > 0:
+                keyword_scores[q_slug] = score
+    vector_ranked = sorted(cosines.items(), key=lambda kv: (-kv[1], kv[0]))
+    vector_rank = {s: i + 1 for i, (s, _) in enumerate(vector_ranked)}
+    keyword_ranked = sorted(keyword_scores.items(),
+                            key=lambda kv: (-kv[1], kv[0]))
+    keyword_rank = {s: i + 1 for i, (s, _) in enumerate(keyword_ranked)}
+    fused = {}
+    for ranks in (vector_rank, keyword_rank):
+        for q_slug, rank in ranks.items():
+            fused[q_slug] = fused.get(q_slug, 0.0) + 1.0 / (RRF_K + rank)
+    ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))
+    entries = [{
+        "slug": q_slug,
+        "text": texts.get(q_slug),
+        "askedAt": asked.get(q_slug),
+        "score": round(score, 6),
+        "cosine": round(cosines[q_slug], 6) if q_slug in cosines else None,
+        "legs": {"vector": vector_rank.get(q_slug),
+                 "keyword": keyword_rank.get(q_slug)},
+        "about": about.get(q_slug, []),
+    } for q_slug, score in ordered[:limit]]
+    return entries, len(ordered)
+
+
+def main(argv):
+    args = list(argv)
+    limit = 10
+    rerank = "--rerank" in args
+    if rerank:
+        args.remove("--rerank")
+    triplets = "--triplets" in args
+    if triplets:
+        args.remove("--triplets")
+    questions = "--questions" in args
+    if questions:
+        args.remove("--questions")
+    if "--limit" in args:
+        idx = args.index("--limit")
+        if idx + 1 >= len(args):
+            fail(2, USAGE)
+        try:
+            limit = int(args[idx + 1])
+        except ValueError:
+            fail(2, f"--limit must be a positive integer, got '{args[idx + 1]}'")
+        if limit < 1:
+            fail(2, f"--limit must be a positive integer, got {limit}")
+        del args[idx:idx + 2]
+    if len(args) != 2 or not args[1].strip():
+        fail(2, USAGE)
+    slug, query = args
+
+    graph = resolve_graph(slug)
+    api_base = graph["apiBase"]
+
+    # --- fetch the graph (read-only) -------------------------------------
+    # Node metadata WITHOUT the vectors: when the graph carries the
+    # native indexes the vector leg never needs the raw vectors over
+    # HTTP (the pre-DDL tool pulled every 768-float vector per query).
+    node_rows = relate_query(
+        api_base,
+        "MATCH (n) WHERE n.slug IS NOT NULL RETURN n.slug, labels(n)[0], n.name, "
+        "n.alias, n.legalName, n.normalizedName, n.category, n.summary, "
+        "n.embedding IS NOT NULL")
+    nodes = {}
+    for slug_, label, name, alias, legal, norm_name, category, summary, embedded in node_rows:
+        if label in BOOKKEEPING_LABELS:
+            continue
+        nodes[slug_] = {
+            "slug": slug_, "label": label, "name": name, "alias": alias,
+            "legalName": legal, "normalizedName": norm_name,
+            "category": category, "summary": summary,
+            "embedded": bool(embedded),
+        }
+    edge_rows = relate_query(
+        api_base,
+        "MATCH (a)-[]->(b) WHERE a.slug IS NOT NULL AND b.slug IS NOT NULL "
+        "RETURN a.slug, b.slug")
+    adjacency = {s: set() for s in nodes}
+    for a, b in edge_rows:
+        if a in adjacency and b in adjacency and a != b:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+
+    # --- discover the native indexes (engine DDL from bin/relate) --------
+    vector_indexes = {}   # label -> index name (VECTOR on embedding)
+    fulltext_index = None
+    for row in relate_query(api_base, "SHOW INDEXES"):
+        # fields: id, name, state, populationPercent, type, entityType,
+        # labelsOrTypes, properties, indexProvider, owningConstraint, ...
+        if len(row) < 8:
+            continue
+        name, itype, labels, props = row[1], row[4], row[6] or [], row[7] or []
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9_]+", name):
+            continue
+        if itype == "VECTOR" and props == ["embedding"] and len(labels) == 1:
+            vector_indexes[labels[0]] = name
+        elif itype == "FULLTEXT":
+            fulltext_index = name
+
+    # --- leg 1: vector ----------------------------------------------------
+    base = ollama_base()
+    ensure_ollama(base)
+    query_vector = embed_query(base, query)
+    vector_cosine = {}
+    if vector_indexes:
+        vector_leg = "native"
+        for label, index_name in sorted(vector_indexes.items()):
+            rows = relate_query(
+                api_base,
+                f"CALL db.index.vector.queryNodes('{index_name}', 10000, $qv) "
+                "YIELD node, score RETURN node.slug, score",
+                {"qv": query_vector})
+            for node_slug, score in rows:
+                if node_slug in nodes and isinstance(score, (int, float)):
+                    # Engine scores are the rebounded (1+cos)/2; the gate
+                    # and all downstream math live in raw-cosine space.
+                    vector_cosine[node_slug] = 2.0 * float(score) - 1.0
+    else:
+        vector_leg = "python"
+        vec_rows = relate_query(
+            api_base,
+            "MATCH (n) WHERE n.slug IS NOT NULL AND n.embedding IS NOT NULL "
+            "RETURN n.slug, n.embedding")
+        for node_slug, vec in vec_rows:
+            if node_slug in nodes and isinstance(vec, list) \
+                    and len(vec) == len(query_vector):
+                vector_cosine[node_slug] = raw_cosine(
+                    query_vector, [float(x) for x in vec])
+    all_cosine = dict(vector_cosine)  # ungated — triplet scoring uses it
+    vector_ranked = sorted(
+        ((c, s) for s, c in vector_cosine.items() if c >= VECTOR_MIN_COSINE),
+        key=lambda t: (-t[0], t[1]))
+    vector_rank = {s: i + 1 for i, (_, s) in enumerate(vector_ranked)}
+    vector_cosine = {s: c for c, s in vector_ranked}
+
+    # --- leg 2: keyword ---------------------------------------------------
+    terms = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
+    matched_fields = {}
+
+    def matched_fields_for(node):
+        fields = []
+        for field, _weight in FIELD_WEIGHTS:
+            value = _field_text(node.get(field))
+            if value is not None and any(t in value.lower() for t in terms):
+                fields.append(field)
+        return fields
+
+    if fulltext_index and terms:
+        keyword_leg = "native"
+        rows = relate_query(
+            api_base,
+            f"CALL db.index.fulltext.queryNodes('{fulltext_index}', $q) "
+            "YIELD node, score RETURN node.slug, score",
+            {"q": " ".join(terms)})
+        native_scores = {}
+        for node_slug, score in rows:
+            if node_slug in nodes and isinstance(score, (int, float)):
+                native_scores[node_slug] = float(score)
+        keyword_ranked = sorted(native_scores.items(),
+                                key=lambda kv: (-kv[1], kv[0]))
+        for node_slug in native_scores:
+            fields = matched_fields_for(nodes[node_slug])
+            if fields:
+                matched_fields[node_slug] = fields
+    else:
+        keyword_leg = "python"
+        keyword_scores = {}
+        for node in nodes.values():
+            score = 0
+            fields = []
+            for field, weight in FIELD_WEIGHTS:
+                value = _field_text(node.get(field))
+                if value is None:
+                    continue
+                lowered = value.lower()
+                hits = sum(1 for t in terms if t in lowered)
+                if hits:
+                    score += weight * hits
+                    fields.append(field)
+            if len(terms) > 1:
+                phrase = query.strip().lower()
+                for field, bonus in PHRASE_BONUS:
+                    value = _field_text(node.get(field))
+                    if value is not None and phrase in value.lower():
+                        score += bonus
+                        if field not in fields:
+                            fields.append(field)
+            if score > 0:
+                keyword_scores[node["slug"]] = score
+                matched_fields[node["slug"]] = fields
+        keyword_ranked = sorted(keyword_scores.items(),
+                                key=lambda kv: (-kv[1], kv[0]))
+    keyword_rank = {s: i + 1 for i, (s, _) in enumerate(keyword_ranked)}
+
+    # --- leg 3: traversal (one hop from vector+keyword seeds) -------------
+    seeds = set(vector_rank) | set(keyword_rank)
+    traversal_counts = {}
+    for node_slug in nodes:
+        touched = len(adjacency[node_slug] & seeds)
+        if touched:
+            traversal_counts[node_slug] = touched
+    traversal_ranked = sorted(traversal_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    traversal_rank = {s: i + 1 for i, (s, _) in enumerate(traversal_ranked)}
+
+    # --- fuse with RRF ------------------------------------------------------
+    fused = {}
+    for ranks in (vector_rank, keyword_rank, traversal_rank):
+        for node_slug, rank in ranks.items():
+            fused[node_slug] = fused.get(node_slug, 0.0) + 1.0 / (RRF_K + rank)
+    ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    # --- questions leg (only with --questions; see question_leg) ------------
+    prior_questions, question_candidates = None, 0
+    if questions:
+        prior_questions, question_candidates = question_leg(
+            api_base, query, terms, query_vector, limit)
+
+    if triplets:
+        # Triplet mode: rank FACT edges, resolve the top ones to fact
+        # lines. No per-triplet embeddings are created (Cognee removed
+        # theirs, SDK-1115) — the score combines the stored fact
+        # vector's distance, the endpoint distances, and structure.
+        sym_vector = embed_query(base, query, prefix=SYM_PREFIX)
+        fact_rows = relate_query(
+            api_base,
+            "MATCH (a)-[r]->(b) WHERE r.fact IS NOT NULL "
+            "RETURN a.slug, a.name, type(r), b.slug, b.name, r.fact, "
+            "r.fact_embedding, r.feedback_weight, r.importance_weight")
+        scored = []
+        for fa, na, etype, fb, nb, fact, fvec, fw, iw in fact_rows:
+            if fa not in nodes or fb not in nodes:
+                continue
+            fact_cos = None
+            if isinstance(fvec, list) and len(fvec) == len(sym_vector):
+                fact_cos = raw_cosine(sym_vector, [float(x) for x in fvec])
+            ca = all_cosine.get(fa)
+            cb = all_cosine.get(fb)
+            seed_hits = (fa in seeds) + (fb in seeds)
+            if not ((fact_cos is not None and fact_cos >= TRIPLET_FACT_GATE)
+                    or seed_hits):
+                continue
+            endpoints = [c for c in (ca, cb) if c is not None]
+            endpoint_max = max(endpoints) if endpoints else 0.0
+            endpoint_mean = (sum(endpoints) / len(endpoints)) if endpoints else 0.0
+            structure = seed_hits / 2.0
+            score = (TRIPLET_WEIGHTS["fact"] * (fact_cos or 0.0)
+                     + TRIPLET_WEIGHTS["endpointMax"] * endpoint_max
+                     + TRIPLET_WEIGHTS["endpointMean"] * endpoint_mean
+                     + TRIPLET_WEIGHTS["structure"] * structure)
+            fw = fw if isinstance(fw, (int, float)) else 0.5
+            iw = iw if isinstance(iw, (int, float)) else 0.5
+            weight_factor = 0.5 + (float(fw) + float(iw)) / 2.0
+            scored.append({
+                "from": fa, "fromName": na or fa, "type": etype,
+                "to": fb, "toName": nb or fb, "fact": fact,
+                "score": round(score * weight_factor, 6),
+                "parts": {
+                    "factCosine": round(fact_cos, 6) if fact_cos is not None else None,
+                    "endpointMax": round(endpoint_max, 6),
+                    "endpointMean": round(endpoint_mean, 6),
+                    "structure": structure,
+                    "weightFactor": round(weight_factor, 6),
+                },
+            })
+        scored.sort(key=lambda t: (-t["score"], t["from"], t["type"], t["to"]))
+        payload = {
+            "query": query, "graph": slug, "mode": "triplets",
+            "engine": {"vectorLeg": vector_leg, "keywordLeg": keyword_leg},
+            "tripletWeights": TRIPLET_WEIGHTS,
+            "results": scored[:limit],
+            "counts": {"factEdges": len(fact_rows),
+                       "candidates": len(scored)},
+        }
+        if questions:
+            payload["priorQuestions"] = prior_questions
+            payload["counts"]["questionCandidates"] = question_candidates
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    def base_result(node_slug, score):
+        node = nodes[node_slug]
+        return {
+            "slug": node_slug,
+            "name": node["name"] if node["name"] else node_slug,
+            "label": node["label"],
+            "score": round(score, 6),
+            "legs": {
+                "vector": vector_rank.get(node_slug),
+                "keyword": keyword_rank.get(node_slug),
+                "traversal": traversal_rank.get(node_slug),
+            },
+            "matchedFields": matched_fields.get(node_slug, []),
+        }
+
+    output = {"query": query, "graph": slug,
+              "engine": {"vectorLeg": vector_leg, "keywordLeg": keyword_leg}}
+    if rerank:
+        # Re-score the top of the fused list with the fixed feature
+        # computation, re-sort, and only then apply --limit.
+        pool = ordered[:RERANK_POOL]
+        max_support = max((traversal_counts.get(s, 0) for s, _ in pool),
+                          default=0)
+        rescored = []
+        for position, (node_slug, fused_score) in enumerate(pool, start=1):
+            feats = rerank_features(nodes[node_slug], query, terms,
+                                    vector_cosine.get(node_slug, 0.0),
+                                    traversal_counts.get(node_slug, 0),
+                                    max_support)
+            rscore = round(sum(RERANK_WEIGHTS[k] * feats[k]
+                               for k in RERANK_WEIGHTS), 6)
+            rescored.append((node_slug, fused_score, position, rscore, feats))
+        rescored.sort(key=lambda t: (-t[3], t[0]))
+        results = []
+        for node_slug, fused_score, position, rscore, feats in rescored[:limit]:
+            entry = base_result(node_slug, fused_score)
+            entry["fusedRank"] = position
+            entry["rerank"] = {
+                "score": rscore,
+                "features": {k: round(feats[k], 6) for k in RERANK_WEIGHTS},
+            }
+            results.append(entry)
+        output["reranked"] = True
+        output["rerankWeights"] = RERANK_WEIGHTS
+        output["results"] = results
+    else:
+        output["results"] = [base_result(s, sc) for s, sc in ordered[:limit]]
+    output["counts"] = {
+        "vectorCandidates": len(vector_rank),
+        "keywordCandidates": len(keyword_rank),
+        "traversalCandidates": len(traversal_rank),
+    }
+    if questions:
+        output["priorQuestions"] = prior_questions
+        output["counts"]["questionCandidates"] = question_candidates
+
+    print(json.dumps(output, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

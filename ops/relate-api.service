@@ -1,0 +1,13 @@
+[Unit]
+Description=Relate by Neo4j HTTP Query API - Space graph (blank, writable, loopback only)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/hatch/.local/bin/relate serve --database /home/hatch/workspace/relate-space/space-graph.rl --http 7475 --auth none
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target default.target

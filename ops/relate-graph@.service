@@ -1,0 +1,14 @@
+[Unit]
+Description=Relate by Neo4j HTTP Query API - graph %i (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/hatch/workspace/relate-space/graphs/%i.env
+ExecStart=/home/hatch/.local/bin/relate serve --database ${DB_PATH} --http ${PORT} --auth none
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target default.target

@@ -1,0 +1,514 @@
+@prefix hmg:     <https://ontology.muse.local/memory-graph#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix foaf:    <http://xmlns.com/foaf/0.1/> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix time:    <http://www.w3.org/2006/time#> .
+@prefix skos:    <http://www.w3.org/2004/02/skos/core#> .
+@prefix org:     <http://www.w3.org/ns/org#> .
+@prefix schema:  <https://schema.org/> .
+
+#################################################################
+# House Memory Graph Ontology — version 0.2.1
+#
+# v0.2.1 (patch, 2026-11-16, Main request 7 completion): +1 class
+# (ReviewItem) and +2 object properties (SUPERSEDED_BY, DECISION).
+# These are not new ideas — the CLI already writes them
+# (review-add creates ReviewItem nodes; supersede / write-batch
+# write SUPERSEDED_BY links; write_decision writes DECISION
+# links) — but v0.2.0 left them out of the ontology, so the
+# stamped schema did not cover everything the system writes.
+# v0.2.1 closes that gap; no other term changes. Category set
+# gains review-item.
+#
+# SUPERSEDES 0.1.0 (2026-11-16). Change log, v0.2.0:
+#   * +8 classes: Company, Project, Place, Event, Decision,
+#     Commitment, Bid, Account. The graph is no longer only
+#     people/groups/documents: it now models the things that
+#     matter in Johnny's records — the companies he runs and
+#     works with, the projects he builds, the places work
+#     happens, the dated events and deadlines, the decisions
+#     he made, the commitments he owes, the bids he chases,
+#     and the service accounts the operation runs on.
+#     (Job: Main request 7, Johnny: "It should be a bigger
+#     ontology then groups people places it should be shit
+#     that matters.")
+#   * +17 object properties: OWNS, OPERATES, WORKS_FOR, LEADS,
+#     WORKS_ON, CLIENT_OF, PART_OF, PLACED_BY, BID_FOR,
+#     LOCATED_IN, INVOLVES, DECIDED_BY, CONCERNS, REQUIRES,
+#     KNOWS, FAMILY_OF, HOLDS.
+#   * +10 datatype properties: status, amount, currency,
+#     dueDate, startDate, endDate, email, address, service,
+#     outcome.
+#   * CORRECTED: ABOUT. v0.1.0 declared domain Question, but
+#     all 7 ABOUT edges actually in Main are SourceDocument ->
+#     Person (the standing files are ABOUT Johnny). v0.2.0
+#     widens the domain to Question | SourceDocument and says
+#     so: a document being about a person is the canonical
+#     use of dcterms:subject. Question-ABOUT edges stay
+#     lead-grade retrieval evidence; SourceDocument-ABOUT is
+#     a document-subject assertion.
+#   * WIDENED: MEMBER_OF range is now Group | Company (a
+#     person is a member of a company as well as a group).
+#   * Category closed set extended with: company, project,
+#     place, event, decision, commitment, bid, account.
+#   * Group is UNCHANGED in scope (informal collectives,
+#     channels, teams). The two current Group nodes that are
+#     LLCs (Sky's the Limit Painting LLC, Make It Happen
+#     Entertainment LLC) are Company candidates: re-typing
+#     them is a categorize-stage decision, NOT done by this
+#     version bump — no node is re-typed by stamping.
+#
+# Everything v0.1.0 said still holds unless noted above.
+# Alignments are asserted only where they genuinely hold;
+# comments say so where they do not.
+#################################################################
+
+<https://ontology.muse.local/memory-graph> a owl:Ontology ;
+    dcterms:title "House Memory Graph Ontology" ;
+    dcterms:creator "Muse (for Johnny Cage)" ;
+    dcterms:created "2026-11-16"^^xsd:date ;
+    owl:versionInfo "0.2.1" ;
+    rdfs:comment "House ontology for the Relate memory graphs, v0.2.1: people, groups, companies, projects, places, events, decisions, commitments, bids, accounts, review items, and source documents, aligned to FOAF, PROV-O, OWL-Time, SKOS, Dublin Core Terms, W3C ORG, and schema.org where the alignment is real. v0.2.1 adds the ReviewItem class and the SUPERSEDED_BY / DECISION properties the CLI already writes." ;
+    rdfs:seeAlso <https://ontology.muse.local/memory-graph> .
+
+#################################################################
+# Classes  (graph node labels)
+#################################################################
+
+hmg:Person a owl:Class ;
+    rdfs:label "Person" ;
+    rdfs:comment "A person recorded in the memory graph (graph label: Person). Identity is the node's slug property, never the display name: two people can share a name, and one person can carry a legal name plus aliases (see hmg:legalName / hmg:alias). Every house Person is a FOAF person and a schema.org Person, so subclassing both is honest." ;
+    rdfs:subClassOf foaf:Person , schema:Person .
+
+hmg:Group a owl:Class ;
+    rdfs:label "Group" ;
+    rdfs:comment "A group, crew, channel, team, or community recorded in the memory graph (graph label: Group). House Group is deliberately broader than org:Organization: it covers formal organizations and informal collectives alike. It subclasses foaf:Group only; org:Organization and schema:Organization are seeAlso because only some house Groups are organizations in the W3C ORG sense. NOTE (v0.2.0): formal organizations now have their own class, hmg:Company. Group keeps the informal side (channels, teams, collectives); the two LLC Groups currently in Main are Company candidates for a later categorize-stage re-type, not re-typed by this version." ;
+    rdfs:subClassOf foaf:Group ;
+    rdfs:seeAlso org:Organization , schema:Organization .
+
+hmg:Company a owl:Class ;
+    rdfs:label "Company" ;
+    rdfs:comment "A formal organization — a company, LLC, agency, or institution Johnny owns, operates for, works with, or bids to (graph label: Company). Grounded in Main's own content: Sky's the Limit Painting LLC and Make It Happen Entertainment LLC are currently typed Group and are the first Company candidates; vendors and clients named in the people pages (Schad Tracy Signs, Meyer Contracting, Fuze Real Estate, Regions Hospital) are the next. Subclasses org:Organization, schema:Organization, and foaf:Organization — all three hold for a formal company." ;
+    rdfs:subClassOf org:Organization , schema:Organization , foaf:Organization .
+
+hmg:Project a owl:Class ;
+    rdfs:label "Project" ;
+    rdfs:comment "A named build, initiative, or workstream Johnny runs (graph label: Project). Grounded in the records: Prospect Studio, Contractor OS, the DJ YS site, Sites Factory, the Relate graph itself, the micro-opportunity machine. A Project is what bids are for, what people lead and work on, and what decisions are about. schema:Project is the alignment." ;
+    rdfs:subClassOf schema:Project .
+
+hmg:Place a owl:Class ;
+    rdfs:label "Place" ;
+    rdfs:comment "A geographic place or job site (graph label: Place). Johnny's order named places as already in scope, but v0.1.0 had no Place class at all — v0.2.0 adds it. Grounded in the records: Twin Cities, Stillwater, Oakdale, job sites such as 2150 Wilson Ave #137. schema:Place is the alignment; address is stored with hmg:address." ;
+    rdfs:subClassOf schema:Place .
+
+hmg:Event a owl:Class ;
+    rdfs:label "Event" ;
+    rdfs:comment "A dated occurrence in Johnny's world (graph label: Event): a letting, a deadline, a demo, an orientation, a meeting. Grounded in the records: the MnDOT letting Wed Nov 18 2026, the DLI Dec 1 2026 deadline, the Nov 3 APEX orientation, the Oct 23 Soar demo (canceled). schema:Event is the alignment; the event's date is hmg:startDate / hmg:endDate, its place hmg:LOCATED_IN, its participants hmg:INVOLVES." ;
+    rdfs:subClassOf schema:Event ;
+    rdfs:seeAlso time:TemporalEntity .
+
+hmg:Decision a owl:Class ;
+    rdfs:label "Decision" ;
+    rdfs:comment "A recorded choice with a decider and a date (graph label: Decision). Grounded in the records: OmniRoute as the model/embedding provider, the blank-graph decision for the Relate Space, the conditional GO on DJ YS production. A Decision is evidence that a choice was made, not the choice's justification — the outcome goes in hmg:outcome, the decider in hmg:DECIDED_BY, the subject in hmg:CONCERNS. NO standard equivalent: schema.org has no Decision type; prov:Activity is seeAlso only (a decision is an activity in the loosest sense)." ;
+    rdfs:seeAlso prov:Activity .
+
+hmg:Commitment a owl:Class ;
+    rdfs:label "Commitment" ;
+    rdfs:comment "An obligation Johnny (or someone in the graph) owes, with a due date and an owner (graph label: Commitment). Grounded in the records: sub-quotes due Tue Nov 17, Anthony's DLI signatures before the Nov 30 cutoff, owner-step queue items. hmg:dueDate is the deadline, hmg:REQUIRES names who owes it, hmg:status tracks open/done. NO standard equivalent: schema.org has no Obligation type; schema:Action is seeAlso only (a commitment is an action to be performed)." ;
+    rdfs:seeAlso schema:Action .
+
+hmg:Bid a owl:Class ;
+    rdfs:label "Bid" ;
+    rdfs:comment "A bid, quote, or deal pursued or won (graph label: Bid). Grounded in the records: Sherburne 17017, Mille Lacs 048-603-003, Hennepin 4630006, the Matt Lehman $3,900 job. hmg:amount / hmg:currency carry the money, hmg:status carries open/won/lost/out-of-scope, hmg:PLACED_BY names the bidding company, hmg:BID_FOR names the project or place. schema:Offer is seeAlso only: a contractor's bid is an offer of services, but Offer's usual sense is goods for sale, so subclassing would overstate it." ;
+    rdfs:seeAlso schema:Offer .
+
+hmg:Account a owl:Class ;
+    rdfs:label "Account" ;
+    rdfs:comment "A service account the operation runs on (graph label: Account). Grounded in the records: the accounts ledger is a first-class record (Vercel johnnyc, Turso, AgentMail inboxes, Langfuse, the Sky's Google login). An Account is held by a Person or Company (hmg:HOLDS); hmg:service names the provider, hmg:handle the username. Credential VALUES are never stored in the graph — the ledger/vault holds those; the graph holds only that the account exists and who holds it. NO standard equivalent." .
+
+hmg:SourceDocument a owl:Class ;
+    rdfs:label "Source Document" ;
+    rdfs:comment "A source document the graph was built from (graph label: SourceDocument): a memory file such as a people page, a groups page, a standing file (MEMORY.md, SOUL.md, ...), an index, or the deep profile. SourceDocuments are the evidence layer: entity nodes exist because a SourceDocument says so, which is exactly PROV-O's notion of an Entity that activities (pipeline runs) used and generated from — hence subclass of prov:Entity. dcterms:BibliographicResource is only seeAlso: these are working memory files, not published bibliographic items, so claiming the subclass would overstate it." ;
+    rdfs:subClassOf prov:Entity ;
+    rdfs:seeAlso dcterms:BibliographicResource , schema:CreativeWork .
+
+hmg:Question a owl:Class ;
+    rdfs:label "Question" ;
+    rdfs:comment "A question Johnny asked in the Relate Graph Space, stored in the graph with its embedding so it can retrieve against embedded nodes and be queried later (graph label: Question). NO standard equivalent: schema:Question models a question on a public Q&A page, which this is not, so it is seeAlso only. House Questions are first-class but kept under their own label precisely so they never pollute entity counts." ;
+    rdfs:seeAlso schema:Question .
+
+hmg:SpaceSignal a owl:Class ;
+    rdfs:label "Space Signal" ;
+    rdfs:comment "A control-plane node (graph label: SpaceSignal) written into the Main graph by the Space's own actions when Johnny sends a chat message or files a dispatch, so a polling hook can see the event and wake an agent. It is an operational trigger, not knowledge: it carries kind / refId / graphSlug / at / consumed and is expected to be short-lived. NO standard equivalent exists; prov:Activity is seeAlso only because a signal records that an event occurred, in the loosest sense." ;
+    rdfs:seeAlso prov:Activity .
+
+hmg:ReviewItem a owl:Class ;
+    rdfs:label "Review Item" ;
+    rdfs:comment "A review item for something the pipeline could not decide (graph label: ReviewItem): an undecidable contradiction, a duplicate candidate, or a low-confidence finding, carrying kind (duplicate, conflict, low-confidence), a subject JSON blob, explicit choices, a status (open/resolved), the filed resolution, and an at timestamp. Resolving one logs a Decision. NO standard equivalent; house-only control-plane node, like SpaceSignal." .
+
+#################################################################
+# Object properties  (graph relationship types)
+#################################################################
+
+hmg:MENTIONS a owl:ObjectProperty ;
+    rdfs:label "MENTIONS" ;
+    rdfs:comment "Graph type MENTIONS: a SourceDocument mentions an entity (Person, Group, Company, Project, Place, Event, Decision, Commitment, Bid, Account, or another SourceDocument). Asserted by the import stage from document text. schema:mentions is the same idea on the public web." ;
+    rdfs:domain hmg:SourceDocument ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company hmg:Project hmg:Place hmg:Event hmg:Decision hmg:Commitment hmg:Bid hmg:Account hmg:SourceDocument ) ] ;
+    rdfs:seeAlso schema:mentions .
+
+hmg:DESCRIBED_IN a owl:ObjectProperty ;
+    rdfs:label "DESCRIBED_IN" ;
+    rdfs:comment "Graph type DESCRIBED_IN: an entity (Person, Group, Company, Project, or other describable node) is described in its dedicated SourceDocument (its people/groups page, or its record file). NOT declared owl:inverseOf hmg:MENTIONS on purpose: the pipeline asserts the two independently with different semantics — MENTIONS is every mention found in any document (116 edges in Main at first build), DESCRIBED_IN is only the entity-to-its-own-page link (56 edges). Treating them as strict inverses would be false." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company hmg:Project hmg:Place hmg:Event hmg:Decision hmg:Commitment hmg:Bid hmg:Account ) ] ;
+    rdfs:range hmg:SourceDocument .
+
+hmg:IN_JOHNNYS_NETWORK a owl:ObjectProperty ;
+    rdfs:label "IN_JOHNNYS_NETWORK" ;
+    rdfs:comment "Graph type IN_JOHNNYS_NETWORK: the subject (Person, Group, or Company) is in Johnny's network, asserted toward the hub Person node for Johnny. House-only semantics: foaf:knows is the nearest standard but means mutual-ish acquaintance between two people, whereas this is a directed hub assertion from Johnny's own records — seeAlso, not subPropertyOf." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company ) ] ;
+    rdfs:range hmg:Person ;
+    rdfs:seeAlso foaf:knows .
+
+hmg:ABOUT a owl:ObjectProperty ;
+    rdfs:label "ABOUT" ;
+    rdfs:comment "Graph type ABOUT: a Question is about a node, OR a SourceDocument is about a Person (v0.2.0 correction — see header). Question-ABOUT edges are lead-grade: they are written when a question is answered, from embedding retrieval over the graph, and record what the answer was grounded in — retrieval evidence, not asserted fact. SourceDocument-ABOUT edges are document-subject assertions (in Main: the standing files are ABOUT Johnny) — the canonical use of dcterms:subject. dcterms:subject and schema:about are the standard analogues for both uses." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Question hmg:SourceDocument ) ] ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company hmg:Project hmg:Place hmg:Event hmg:Decision hmg:Commitment hmg:Bid hmg:Account hmg:SourceDocument ) ] ;
+    rdfs:seeAlso dcterms:subject , schema:about .
+
+hmg:ASSISTANT_OF a owl:ObjectProperty ;
+    rdfs:label "ASSISTANT_OF" ;
+    rdfs:comment "Graph type ASSISTANT_OF: the subject Person serves as assistant to the object Person (in Main: Muse -> Johnny, 1 edge). NO standard equivalent: org and FOAF model membership and roles inside organizations, not a personal assistant-of relation between two people. House-only, deliberately unmapped." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Person .
+
+hmg:MEMBER_OF a owl:ObjectProperty ;
+    rdfs:label "MEMBER_OF" ;
+    rdfs:comment "Graph type MEMBER_OF: a Person is a member of a Group or a Company. Defined in v0.1.0 for forward use — FOAF and W3C ORG both treat membership as core — and NOT yet asserted in Main (0 edges as of 2026-11-16; groups currently connect via documents and IN_JOHNNYS_NETWORK). v0.2.0 widens the range from Group to Group | Company. Direction matches org:memberOf (agent -> organization); the house range is the broader hmg:Group plus hmg:Company, so this is subPropertyOf org:memberOf only in spirit — recorded as seeAlso to stay honest. foaf:member is the same relation stated from the group side." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Group hmg:Company ) ] ;
+    rdfs:seeAlso org:memberOf , foaf:member .
+
+hmg:OWNS a owl:ObjectProperty ;
+    rdfs:label "OWNS" ;
+    rdfs:comment "Graph type OWNS: a Person owns a Company (in Main's records: Anthony Briseno owns Sky's the Limit Painting LLC). Ownership is a legal fact — assert only from a source that states it, never from someone merely working with the company. schema:owns is the same idea; recorded as seeAlso because schema:owns ranges over any Thing, while house OWNS is Person -> Company." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Company ;
+    rdfs:seeAlso schema:owns .
+
+hmg:OPERATES a owl:ObjectProperty ;
+    rdfs:label "OPERATES" ;
+    rdfs:comment "Graph type OPERATES: a Person operates (runs ops for) a Company without owning it (in Main's records: Johnny runs ops as Director of Operations and Business Development for Sky's, which Anthony owns). Owning and operating are different facts — never collapse one into the other. NO standard equivalent: org models roles inside organizations, not an operator relation between a person and a company. House-only, deliberately unmapped." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Company .
+
+hmg:WORKS_FOR a owl:ObjectProperty ;
+    rdfs:label "WORKS_FOR" ;
+    rdfs:comment "Graph type WORKS_FOR: a Person works for a Company (employment or regular crew work). The person's job title, when the sources state one, goes on the edge as a role qualifier, not on the Person node (one person can hold different roles at different companies). schema:worksFor is the alignment; org:memberOf is seeAlso." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Company ;
+    rdfs:seeAlso schema:worksFor , org:memberOf .
+
+hmg:LEADS a owl:ObjectProperty ;
+    rdfs:label "LEADS" ;
+    rdfs:comment "Graph type LEADS: a Person leads a Project (in Main's records: Muse as coordinator lead on the DJ YS and Prospect Studio work, Bot 7 as execution lead). Leading is accountability for the project, not employment by a company. NO standard equivalent. House-only." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Project .
+
+hmg:WORKS_ON a owl:ObjectProperty ;
+    rdfs:label "WORKS_ON" ;
+    rdfs:comment "Graph type WORKS_ON: a Person works on a Project (contributes, without necessarily leading it). Distinct from WORKS_FOR: WORKS_ON is about the project, WORKS_FOR about the employer. NO standard equivalent. House-only." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Project .
+
+hmg:CLIENT_OF a owl:ObjectProperty ;
+    rdfs:label "CLIENT_OF" ;
+    rdfs:comment "Graph type CLIENT_OF: the subject (a Person or a Company) is a client of the object Company — the object performs work for the subject. Direction is client -> provider (the reverse of schema:provider, recorded as seeAlso). Grounded in the records: Fuze Real Estate has Sky's as an approved vendor; Regions Hospital was a signage prospect." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Company ) ] ;
+    rdfs:range hmg:Company ;
+    rdfs:seeAlso schema:provider .
+
+hmg:PART_OF a owl:ObjectProperty ;
+    rdfs:label "PART_OF" ;
+    rdfs:comment "Graph type PART_OF: the subject (a Project, a Group, or a Company) is part of the object (a Company or a Project) — a sub-project inside a program, a team inside a company, a subsidiary inside a parent. schema:isPartOf is the analogue (recorded as seeAlso; its home is CreativeWork, so subclassing would overstate it). org:subOrganizationOf is the same relation stated from the parent side for organizations." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Project hmg:Group hmg:Company ) ] ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Company hmg:Project ) ] ;
+    rdfs:seeAlso schema:isPartOf , org:subOrganizationOf .
+
+hmg:PLACED_BY a owl:ObjectProperty ;
+    rdfs:label "PLACED_BY" ;
+    rdfs:comment "Graph type PLACED_BY: a Bid was placed by a Company (the bidder). A bid without a bidder is an orphan — every Bid node must carry exactly one PLACED_BY edge." ;
+    rdfs:domain hmg:Bid ;
+    rdfs:range hmg:Company .
+
+hmg:BID_FOR a owl:ObjectProperty ;
+    rdfs:label "BID_FOR" ;
+    rdfs:comment "Graph type BID_FOR: a Bid is for a Project or a Place (the job being bid on). A bid without a target is an orphan — every Bid node must carry exactly one BID_FOR edge." ;
+    rdfs:domain hmg:Bid ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Project hmg:Place ) ] .
+
+hmg:LOCATED_IN a owl:ObjectProperty ;
+    rdfs:label "LOCATED_IN" ;
+    rdfs:comment "Graph type LOCATED_IN: the subject (a Company, Project, Event, or Bid) is located in / takes place in a Place. schema:location is the analogue (recorded as seeAlso; its domain is broad, house LOCATED_IN is narrower and directed)." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Company hmg:Project hmg:Event hmg:Bid ) ] ;
+    rdfs:range hmg:Place ;
+    rdfs:seeAlso schema:location .
+
+hmg:INVOLVES a owl:ObjectProperty ;
+    rdfs:label "INVOLVES" ;
+    rdfs:comment "Graph type INVOLVES: an Event involves a Person, Company, or Project (participant, organizer, subject). schema:about is the analogue for subject-hood; attendance alone does not prove involvement — assert only when a source ties the entity to the event." ;
+    rdfs:domain hmg:Event ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Company hmg:Project ) ] ;
+    rdfs:seeAlso schema:about .
+
+hmg:DECIDED_BY a owl:ObjectProperty ;
+    rdfs:label "DECIDED_BY" ;
+    rdfs:comment "Graph type DECIDED_BY: a Decision was made by a Person (or a Company acting through a person — in that case the Person node is the decider and the Company is reached via the person). Every Decision node must carry exactly one DECIDED_BY edge: a decision with no decider is hearsay." ;
+    rdfs:domain hmg:Decision ;
+    rdfs:range hmg:Person .
+
+hmg:CONCERNS a owl:ObjectProperty ;
+    rdfs:label "CONCERNS" ;
+    rdfs:comment "Graph type CONCERNS: a Decision concerns (is about) a Person, Company, Project, Place, Bid, or Commitment — the thing the choice was about. dcterms:subject is the standard analogue." ;
+    rdfs:domain hmg:Decision ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Company hmg:Project hmg:Place hmg:Bid hmg:Commitment ) ] ;
+    rdfs:seeAlso dcterms:subject .
+
+hmg:REQUIRES a owl:ObjectProperty ;
+    rdfs:label "REQUIRES" ;
+    rdfs:comment "Graph type REQUIRES: a Commitment is owed by / required of a Person or Company (the owner of the obligation). The due date is hmg:dueDate on the Commitment node. NO standard equivalent. House-only." ;
+    rdfs:domain hmg:Commitment ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Company ) ] .
+
+hmg:KNOWS a owl:ObjectProperty ;
+    rdfs:label "KNOWS" ;
+    rdfs:comment "Graph type KNOWS: one Person knows another Person (mutual-ish acquaintance, the FOAF relation). Distinct from IN_JOHNNYS_NETWORK: KNOWS is person-to-person, IN_JOHNNYS_NETWORK is the directed hub assertion that someone is in Johnny's network. Assert only from evidence of a real relationship, never from a shared mention." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Person ;
+    rdfs:subPropertyOf foaf:knows .
+
+hmg:FAMILY_OF a owl:ObjectProperty ;
+    rdfs:label "FAMILY_OF" ;
+    rdfs:comment "Graph type FAMILY_OF: one Person is family of another Person (in Main's records: Susie Lynaugh is Johnny's mother, Renee is his grandmother). Family is a fact the sources state; never infer it from a shared surname. schema:relatedTo is the analogue (recorded as seeAlso — relatedTo is broader than family)." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range hmg:Person ;
+    rdfs:seeAlso schema:relatedTo .
+
+hmg:HOLDS a owl:ObjectProperty ;
+    rdfs:label "HOLDS" ;
+    rdfs:comment "Graph type HOLDS: a Person or Company holds an Account (the account belongs to their login/identity). The graph records only that the account exists and who holds it — credential values live in the vault/ledger, never in the graph." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Company ) ] ;
+    rdfs:range hmg:Account .
+
+hmg:SUPERSEDED_BY a owl:ObjectProperty ;
+    rdfs:label "SUPERSEDED_BY" ;
+    rdfs:comment "Graph type SUPERSEDED_BY: the subject was superseded by the object — the retire-and-link relation. Two uses: (1) node to node — the retired old node points at its successor (the new node that replaces it); (2) node to SourceDocument — a corrected node points at the correcting document, with the superseded value kept in supersededValues on the node. The old version is never deleted; it carries retiredAt. prov:wasRevisionOf states the same link from the new version's side (new wasRevisionOf old); house SUPERSEDED_BY states it from the old version's side." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company hmg:Project hmg:Place hmg:Event hmg:Decision hmg:Commitment hmg:Bid hmg:Account hmg:SourceDocument ) ] ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company hmg:Project hmg:Place hmg:Event hmg:Decision hmg:Commitment hmg:Bid hmg:Account hmg:SourceDocument ) ] ;
+    rdfs:seeAlso prov:wasRevisionOf .
+
+hmg:DECISION a owl:ObjectProperty ;
+    rdfs:label "DECISION" ;
+    rdfs:comment "Graph type DECISION: a Decision ledger node points at the node it decided about (the merged-away node, the reconciled term, the stamped ontology — whatever the decision's subject was). Written by the CLI's write_decision when a decision names its subject slug. NO standard equivalent; house-only." ;
+    rdfs:domain hmg:Decision ;
+    rdfs:range [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Group hmg:Company hmg:Project hmg:Place hmg:Event hmg:Decision hmg:Commitment hmg:Bid hmg:Account hmg:SourceDocument hmg:Question hmg:SpaceSignal hmg:ReviewItem ) ] .
+
+
+#################################################################
+# Datatype properties  (graph property keys)
+#
+# Names below are the ontology terms; the comment on each gives
+# the exact property key as stored in the property graph.
+# v0.2.0 ADDS: status, amount, currency, dueDate, startDate,
+# endDate, email, address, service, outcome. All v0.1.0 keys
+# are carried over unchanged.
+#################################################################
+
+hmg:slug a owl:DatatypeProperty ;
+    rdfs:label "slug" ;
+    rdfs:comment "Graph key: slug. The node's stable identity key (lowercase, hyphenated, derived from the normalized name or source path). ALL identity logic — MERGE on write, lookup, dedupe — keys on slug, never on display name. Every node in a house graph MUST carry a slug; the verify stage fails nodes missing one." ;
+    rdfs:range xsd:string .
+
+hmg:name a owl:DatatypeProperty ;
+    rdfs:label "name" ;
+    rdfs:comment "Graph key: name. Human-readable display name. Presentation only — never an identity key (see hmg:slug). Aligns with foaf:name for people/groups and dcterms:title / schema:name for documents." ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso foaf:name , schema:name , dcterms:title .
+
+hmg:legalName a owl:DatatypeProperty ;
+    rdfs:label "legalName" ;
+    rdfs:comment "Graph key: legalName. A person's legal name when the sources state one and it differs from the display name (in Main: the Johnny node carries legalName 'Joshua Whaley'). Set only from evidence in a SourceDocument, never guessed. schema:legalName is the standard term." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso schema:legalName .
+
+hmg:alias a owl:DatatypeProperty ;
+    rdfs:label "alias" ;
+    rdfs:comment "Graph key: alias. An alternate name/handle the sources explicitly give for the same person (in Main: alias 'Johnny Cage' on the Johnny node). Aliases are evidence for entity resolution, recorded by the normalization stage alongside the merge they justify." ;
+    rdfs:domain hmg:Person ;
+    rdfs:range xsd:string .
+
+hmg:normalizedName a owl:DatatypeProperty ;
+    rdfs:label "normalizedName" ;
+    rdfs:comment "Graph key: normalizedName. The normalization stage's canonical display form of the name (consistent casing/format). Kept next to the raw name so normalization is auditable and reversible." ;
+    rdfs:range xsd:string .
+
+hmg:normalizedSlug a owl:DatatypeProperty ;
+    rdfs:label "normalizedSlug" ;
+    rdfs:comment "Graph key: normalizedSlug. The slug recomputed from normalizedName by the normalization stage; must equal hmg:slug on every node. The cleaning stage flags any node where the two disagree or either is missing." ;
+    rdfs:range xsd:string .
+
+hmg:category a owl:DatatypeProperty ;
+    rdfs:label "category" ;
+    rdfs:comment "Graph key: category. The node's house category, assigned by the categorizing stage. Closed value set for memory graphs (v0.2.1): person, group, company, project, place, event, decision, commitment, bid, account, review-item, people-page, groups-page, standing-file, index, profile, document, question. Categories behave like a small SKOS concept scheme but are stored as plain strings for property-graph simplicity — skos:Concept is seeAlso, and promoting categories to real SKOS concepts is a known possible future step, not current practice. Every content node MUST carry a category." ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso skos:Concept .
+
+hmg:community a owl:DatatypeProperty ;
+    rdfs:label "community" ;
+    rdfs:comment "Graph key: community. The community id assigned by the communities stage (e.g. 'community-1'), stored as a string. Communities are a structural fact about the graph (connected components / label propagation over real edges), never an identity claim: sharing a community never means two nodes are the same entity." ;
+    rdfs:range xsd:string .
+
+hmg:sourcePath a owl:DatatypeProperty ;
+    rdfs:label "sourcePath" ;
+    rdfs:comment "Graph key: sourcePath. SourceDocuments only: the workspace path of the file the node was built from. Unique per label — the cleaning stage flags duplicate sourcePath values as un-merged duplicates. This is the node's provenance anchor back to the evidence on disk (cf. prov:wasDerivedFrom, stated here as data rather than an edge)." ;
+    rdfs:domain hmg:SourceDocument ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso prov:wasDerivedFrom .
+
+hmg:summary a owl:DatatypeProperty ;
+    rdfs:label "summary" ;
+    rdfs:comment "Graph key: summary. A short human-readable summary of a SourceDocument's content. Optional and known-gappy: at Main's first build 58 of 65 SourceDocuments had no summary — the verify stage reports the gap, it does not block on it." ;
+    rdfs:domain hmg:SourceDocument ;
+    rdfs:range xsd:string .
+
+hmg:status a owl:DatatypeProperty ;
+    rdfs:label "status" ;
+    rdfs:comment "Graph key: status. Lifecycle status of a Bid, Commitment, Project, or Event (open values, conventionally: open, in-progress, done, won, lost, out-of-scope, canceled, pending). Set only from a source that states it — never inferred from silence. A Bid with no stated outcome has NO status, not a guessed one." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Bid hmg:Commitment hmg:Project hmg:Event ) ] ;
+    rdfs:range xsd:string .
+
+hmg:amount a owl:DatatypeProperty ;
+    rdfs:label "amount" ;
+    rdfs:comment "Graph key: amount. A money amount in hmg:currency units (Bid only: the bid/contract value). Stored as a number so bids can be summed and compared; the source text ('$3,900') is what the SourceDocument says, the number is the parsed value. Never convert currency without recording it." ;
+    rdfs:domain hmg:Bid ;
+    rdfs:range xsd:decimal .
+
+hmg:currency a owl:DatatypeProperty ;
+    rdfs:label "currency" ;
+    rdfs:comment "Graph key: currency. ISO 4217 currency code for hmg:amount (conventionally 'USD' in this graph). schema:currency is the alignment." ;
+    rdfs:domain hmg:Bid ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso schema:currency .
+
+hmg:dueDate a owl:DatatypeProperty ;
+    rdfs:label "dueDate" ;
+    rdfs:comment "Graph key: dueDate. The deadline by which a Commitment must be met (or a Bid submitted), as an ISO-8601 datetime string. In OWL-Time terms the value is a time:Instant. A Commitment with no stated deadline has NO dueDate — never invent one." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Commitment hmg:Bid hmg:Event ) ] ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso time:Instant .
+
+hmg:startDate a owl:DatatypeProperty ;
+    rdfs:label "startDate" ;
+    rdfs:comment "Graph key: startDate. When an Event or Project starts, as an ISO-8601 datetime string (a time:Instant; the pair startDate/endDate plays the role of a time:ProperInterval's beginning/end, stored flat like validFrom/validTo)." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Event hmg:Project ) ] ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso time:Instant , time:hasBeginning .
+
+hmg:endDate a owl:DatatypeProperty ;
+    rdfs:label "endDate" ;
+    rdfs:comment "Graph key: endDate. When an Event or Project ends, as an ISO-8601 datetime string (a time:Instant; see hmg:startDate). Absent = ongoing / open-ended." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Event hmg:Project ) ] ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso time:Instant , time:hasEnd .
+
+hmg:email a owl:DatatypeProperty ;
+    rdfs:label "email" ;
+    rdfs:comment "Graph key: email. A contact email address for a Person or Company, as stated in a source (e.g. a work mailbox). schema:email is the alignment; foaf:mbox is seeAlso. Email addresses are contact facts, not identity keys." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Person hmg:Company ) ] ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso schema:email , foaf:mbox .
+
+hmg:address a owl:DatatypeProperty ;
+    rdfs:label "address" ;
+    rdfs:comment "Graph key: address. A postal/street address for a Place or Company, as stated in a source (e.g. a job site, an IRS address of record). schema:address is the alignment." ;
+    rdfs:domain [ a owl:Class ; owl:unionOf ( hmg:Place hmg:Company ) ] ;
+    rdfs:range xsd:string ;
+    rdfs:seeAlso schema:address .
+
+hmg:service a owl:DatatypeProperty ;
+    rdfs:label "service" ;
+    rdfs:comment "Graph key: service. The provider/service name for an Account node (e.g. 'Vercel', 'Turso', 'AgentMail', 'Langfuse'). The Account's login identity is hmg:handle; the service names where the account lives." ;
+    rdfs:domain hmg:Account ;
+    rdfs:range xsd:string .
+
+hmg:outcome a owl:DatatypeProperty ;
+    rdfs:label "outcome" ;
+    rdfs:comment "Graph key: outcome. What a Decision decided, in plain words (Decision only). The outcome is the recorded result ('OmniRoute is the model provider'), not the reasoning behind it — reasoning lives in the SourceDocument." ;
+    rdfs:domain hmg:Decision ;
+    rdfs:range xsd:string .
+
+#################################################################
+# Bitemporal properties
+#
+# Two independent time axes, stored as flat ISO-8601 datetime
+# strings on nodes (and, where a stage writes them, edges):
+#   valid time       — when the fact was true in the world:
+#                      validFrom / validTo
+#   transaction time — when the graph knew it:
+#                      recordedAt / retiredAt
+# A missing property means UNBOUNDED on that side (always valid /
+# recorded from the beginning / never retired). Nothing is ever
+# deleted for time reasons: retiring sets retiredAt (and, for a
+# corrected fact, validTo) and leaves the record in place, so
+# as-of queries can reconstruct both what was true and what the
+# graph believed at any moment.
+#################################################################
+
+hmg:validFrom a owl:DatatypeProperty ;
+    rdfs:label "validFrom" ;
+    rdfs:comment "Graph key: validFrom. Valid-time start: the instant from which the fact held in the world, as an ISO-8601 datetime string. In OWL-Time terms the value is a time:Instant (expressible as time:inXSDDateTimeStamp); validFrom/validTo together play the role of a time:ProperInterval's beginning/end, stored flat instead of reified as interval nodes — a deliberate property-graph simplification, recorded here so nobody mistakes it for full OWL-Time modeling." ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso time:Instant , time:hasBeginning .
+
+hmg:validTo a owl:DatatypeProperty ;
+    rdfs:label "validTo" ;
+    rdfs:comment "Graph key: validTo. Valid-time end: the instant from which the fact stopped holding in the world. Absent = still valid (open-ended). See hmg:validFrom for the OWL-Time alignment and its limits." ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso time:Instant , time:hasEnd .
+
+hmg:recordedAt a owl:DatatypeProperty ;
+    rdfs:label "recordedAt" ;
+    rdfs:comment "Graph key: recordedAt. Transaction-time start: when this node/assertion entered the graph (which pipeline run is in the run's own records). Closest PROV-O analogue is prov:generatedAtTime — the time an entity was generated by an activity — seeAlso rather than equivalence, because PROV-O speaks of entities and activities, not graph assertions." ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso prov:generatedAtTime .
+
+hmg:retiredAt a owl:DatatypeProperty ;
+    rdfs:label "retiredAt" ;
+    rdfs:comment "Graph key: retiredAt. Transaction-time end: when the graph stopped believing/asserting this record (superseded, merged away, or corrected). The record is retired, never deleted. Closest PROV-O analogue is prov:invalidatedAtTime — seeAlso, same caveat as hmg:recordedAt." ;
+    rdfs:range xsd:dateTime ;
+    rdfs:seeAlso prov:invalidatedAtTime .
+
+#################################################################
+# Embedding properties
+#################################################################
+
+hmg:embedding a owl:DatatypeProperty ;
+    rdfs:label "embedding" ;
+    rdfs:comment "Graph key: embedding. The node's embeddinggemma vector, stored in the property graph as a list of floats (768 dimensions; see hmg:embeddingDim / hmg:embeddingModel). RDF has no float-list datatype, so no rdfs:range is asserted here — asserting xsd:string or a scalar numeric range would be false. Text embedded per node is built from its name/handle/bio/text properties by the embeddings stage." ;
+    rdfs:seeAlso hmg:embeddingDim , hmg:embeddingModel .
+
+hmg:embeddingDim a owl:DatatypeProperty ;
+    rdfs:label "embeddingDim" ;
+    rdfs:comment "Graph key: embedding_dim. Dimensionality of hmg:embedding (768 for embeddinggemma). Stored so a model swap can never silently mix vector spaces: retrieval must only compare vectors with equal embedding_dim AND embedding_model." ;
+    rdfs:range xsd:integer .
+
+hmg:embeddingModel a owl:DatatypeProperty ;
+    rdfs:label "embeddingModel" ;
+    rdfs:comment "Graph key: embedding_model. The model that produced hmg:embedding ('embeddinggemma', served by the local Ollama runtime). See hmg:embeddingDim for the comparability rule." ;
+    rdfs:range xsd:string .

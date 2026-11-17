@@ -1,0 +1,4109 @@
+#!/usr/bin/env python3
+"""Typed CLI for the local Relate by Neo4j graphs (connector custom.relate).
+
+The Relate HTTP Query API needs no credential. Each graph is served by its
+own `relate serve` process bound to loopback, and the graphs registry at
+~/workspace/relate-space/graphs/registry.json is the source of truth for
+which graphs exist and where they answer.
+
+Every subcommand prints JSON to stdout. Errors go to stderr with a
+non-zero exit code.
+"""
+
+import contextlib
+import datetime
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+REGISTRY_PATH = os.path.join(HOME, "workspace/relate-space/graphs/registry.json")
+PROVISION_SCRIPT = os.path.join(HOME, "workspace/relate-space/graphs/provision-graph.sh")
+ENSURE_API_SCRIPT = os.path.join(HOME, "workspace/relate-space/ensure-api.sh")
+QUERY_PATH = "/db/neo4j/query/v2"
+NEIGHBOR_LIMIT = 25
+
+# --- Deterministic tool layer constants -------------------------------------
+ONTOLOGIES_DIR = os.path.join(HOME, "workspace/custom-connectors/custom.relate/ontologies")
+RELATE_RUNTIME_DIR = os.path.join(HOME, "workspace/relate-runtime")
+OLLAMA_BASE = "http://127.0.0.1:11434"
+EMBED_MODEL = "embeddinggemma-2"
+EMBED_DIM = 768
+# EmbeddingGemma 2 task formats (model card, "Task Instruction Prefixes"):
+# corpus items are embedded in the document format (compose_embed_text);
+# texts compared against each other (edge fact sentences) use the symmetric
+# sentence-similarity format. The query-side prefix lives in relate-search.
+EMBED_FORMAT = "eg2-doc-v1"
+EMBED_FORMAT_EDGE = "eg2-sym-v1"
+EMBED_SYM_PREFIX = "task: sentence similarity | query: "
+_EMBED_STAMP = None
+
+
+def resolved_model_stamp():
+    """Resolved identity of EMBED_MODEL as Ollama serves it right now:
+    '<parent_model>@<digest[:12]>' from /api/tags, so a re-pull or model
+    swap can never hide behind the mutable tag name on stamped nodes.
+    Falls back to the bare model name if the registry cannot be read."""
+    global _EMBED_STAMP
+    if _EMBED_STAMP:
+        return _EMBED_STAMP
+    stamp = EMBED_MODEL
+    try:
+        request = urllib.request.Request(OLLAMA_BASE + "/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode())
+        for entry in payload.get("models", []):
+            name = entry.get("name") or ""
+            if name == EMBED_MODEL or name.startswith(EMBED_MODEL + ":"):
+                parent = (entry.get("details") or {}).get("parent_model") or name
+                digest = (entry.get("digest") or "")[:12]
+                stamp = f"{parent}@{digest}" if digest else parent
+                break
+    except Exception:
+        pass
+    _EMBED_STAMP = stamp
+    return stamp
+
+CONTENT_LABELS = (
+    "Person", "Group", "SourceDocument",
+    "Company", "Project", "Place", "Event", "Commitment", "Bid",
+    "Account",
+)
+ALLOWED_LABELS = {
+    "Person", "Group", "SourceDocument", "Question", "SpaceSignal",
+    "Ontology", "OntologyClass", "OntologyProperty",
+    "Decision", "ReviewItem",
+    "Company", "Project", "Place", "Event", "Commitment", "Bid",
+    "Account",
+}
+HOUSE_TYPES = {
+    "MENTIONS", "DESCRIBED_IN", "IN_JOHNNYS_NETWORK", "ABOUT",
+    "ASSISTANT_OF", "MEMBER_OF",
+    "OWNS", "OPERATES", "WORKS_FOR", "LEADS", "WORKS_ON",
+    "CLIENT_OF", "PART_OF", "PLACED_BY", "BID_FOR", "LOCATED_IN",
+    "INVOLVES", "DECIDED_BY", "CONCERNS", "REQUIRES", "KNOWS",
+    "FAMILY_OF", "HOLDS", "SUPERSEDED_BY", "DECISION",
+}
+ALLOWED_TYPES = HOUSE_TYPES | {
+    "DEFINES_CLASS", "DEFINES_PROPERTY", "SUPERSEDED_BY", "DECISION", "SIMILAR_TO",
+}
+CONVENTION_TYPES = {"DEFINES_CLASS", "DEFINES_PROPERTY", "SUPERSEDED_BY", "DECISION"}
+# Edge types exempt from the write-batch fact requirement (Cognee steal:
+# every FACT edge carries its one-sentence fact; these types are not
+# fact edges): document attachment (MENTIONS, DESCRIBED_IN), ontology
+# bookkeeping (DEFINES_CLASS, DEFINES_PROPERTY), the correction link
+# (SUPERSEDED_BY), the ledger link (DECISION), and machine-generated
+# lead similarity (SIMILAR_TO — written by `similar`, never write-batch).
+FACT_EXEMPT_TYPES = {
+    "MENTIONS", "DESCRIBED_IN", "DEFINES_CLASS", "DEFINES_PROPERTY",
+    "SUPERSEDED_BY", "DECISION", "SIMILAR_TO",
+}
+CATEGORY_VALUES = {
+    "person", "group", "people-page", "groups-page",
+    "standing-file", "index", "profile",
+    "company", "project", "place", "event", "decision",
+    "commitment", "bid", "account", "review-item", "document",
+    "question",
+}
+SINGLE_VALUE_PROPS = ("legalName", "sourcePath")
+
+
+def _content_scope(var="n"):
+    """Cypher fragment matching any content node.
+
+    Single source for the content scope the deterministic tools share
+    (embed-missing, verify, normalize-scan, categorize, clean-scan,
+    communities, similar). CONTENT_LABELS is the list; a new ontology
+    class joins the scope by one edit there. Decision / ReviewItem /
+    Question / SpaceSignal are control-plane and stay out of scope.
+    """
+    return "(" + " OR ".join(f"{var}:{label}" for label in CONTENT_LABELS) + ")"
+STANDING_FILES = {
+    "MEMORY.md", "SOUL.md", "IDENTITY.md", "USER.md",
+    "AGENTS.md", "TOOLS.md", "HEARTBEAT.md",
+}
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+RDFS_NS = "http://www.w3.org/2000/01/rdf-schema#"
+OWL_NS = "http://www.w3.org/2002/07/owl#"
+DCTERMS_NS = "http://purl.org/dc/terms/"
+DC_NS = "http://purl.org/dc/elements/1.1/"
+_TYPE_KIND_BY_URI = {
+    OWL_NS + "Class": "class",
+    RDFS_NS + "Class": "class",
+    OWL_NS + "ObjectProperty": "object",
+    OWL_NS + "DatatypeProperty": "datatype",
+    OWL_NS + "AnnotationProperty": "annotation",
+    RDF_NS + "Property": "property",
+}
+_XML_TAG_KIND = {
+    f"{{{OWL_NS}}}Class": "class",
+    f"{{{RDFS_NS}}}Class": "class",
+    f"{{{OWL_NS}}}ObjectProperty": "object",
+    f"{{{OWL_NS}}}DatatypeProperty": "datatype",
+    f"{{{OWL_NS}}}AnnotationProperty": "annotation",
+    f"{{{RDF_NS}}}Property": "property",
+}
+_REL_BY_URI = {
+    RDFS_NS + "subClassOf": "subClassOf",
+    RDFS_NS + "subPropertyOf": "subPropertyOf",
+    RDFS_NS + "seeAlso": "seeAlso",
+}
+
+VOCABS = {
+    "house": {"file": "house-memory-graph.ttl", "format": "turtle",
+              "slug": "house-memory-graph", "name": "House Memory Graph Ontology",
+              "namespace": "https://ontology.muse.local/memory-graph#"},
+    "foaf": {"file": "foaf.rdf", "format": "rdfxml", "slug": "foaf",
+             "name": "Friend of a Friend (FOAF) vocabulary",
+             "namespace": "http://xmlns.com/foaf/0.1/"},
+    "prov-o": {"file": "prov-o.ttl", "format": "turtle", "slug": "prov-o",
+               "name": "PROV-O", "namespace": "http://www.w3.org/ns/prov#"},
+    "owl-time": {"file": "owl-time.ttl", "format": "turtle", "slug": "owl-time",
+                 "name": "OWL-Time", "namespace": "http://www.w3.org/2006/time#"},
+    "skos": {"file": "skos.rdf", "format": "rdfxml", "slug": "skos",
+             "name": "SKOS", "namespace": "http://www.w3.org/2004/02/skos/core#"},
+    "dcterms": {"file": "dcterms.rdf", "format": "rdfxml", "slug": "dcterms",
+                "name": "Dublin Core Terms", "namespace": "http://purl.org/dc/terms/"},
+    "org": {"file": "org.ttl", "format": "turtle", "slug": "org",
+            "name": "W3C ORG", "namespace": "http://www.w3.org/ns/org#"},
+    "schema-org": {"file": "schema-org.jsonld", "format": "jsonld", "slug": "schema-org",
+                   "name": "schema.org", "namespace": "https://schema.org/"},
+}
+
+
+def fail(message, code=1):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_registry():
+    try:
+        with open(REGISTRY_PATH) as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        fail(f"graphs registry not found at {REGISTRY_PATH}")
+    except json.JSONDecodeError as exc:
+        fail(f"graphs registry at {REGISTRY_PATH} is not valid JSON: {exc}")
+
+
+def registry_graphs():
+    return load_registry().get("graphs", [])
+
+
+def resolve_graph(slug):
+    graphs = registry_graphs()
+    for graph in graphs:
+        if graph.get("slug") == slug:
+            return graph
+    valid = ", ".join(sorted(g.get("slug", "?") for g in graphs)) or "(none registered)"
+    fail(f"unknown graph slug '{slug}'. Valid slugs: {valid}", code=2)
+
+
+def recovery_hint(graph):
+    if graph.get("slug") == "main":
+        return f"the main graph API looks down. Run {ENSURE_API_SCRIPT} and try again."
+    service = graph.get("service", f"relate-graph@{graph.get('slug')}.service")
+    return f"the API for graph '{graph.get('slug')}' looks down. Run: systemctl start {service}"
+
+
+def _raw_post(url, body_obj, timeout=15, method="POST"):
+    """One HTTP call to a Relate API route. Returns (status, payload) where
+    payload is the parsed JSON body when there is one, else the raw text.
+    HTTP error statuses are RETURNED, not raised (the tx routes need their
+    status codes); connection-level failures still raise URLError."""
+    data = json.dumps(body_obj).encode() if body_obj is not None else None
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method=method
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode()
+            try:
+                return response.status, json.loads(text)
+            except json.JSONDecodeError:
+                return response.status, text
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode(errors="replace")
+        try:
+            return exc.code, json.loads(text)
+        except json.JSONDecodeError:
+            return exc.code, text
+
+
+# Stack of open managed transactions: (graph slug, tx id). While a tx is
+# open for a graph, run_query routes that graph's statements into it.
+_TX_STACK = []
+
+
+def _open_tx_id(graph):
+    for slug, tx_id in reversed(_TX_STACK):
+        if slug == graph["slug"]:
+            return tx_id
+    return None
+
+
+@contextlib.contextmanager
+def managed_tx(graph):
+    """HTTP managed transaction (Query API v2 tx routes — POST
+    /db/neo4j/query/v2/tx begins, POST .../tx/<id>/commit commits,
+    DELETE .../tx/<id> rolls back; ADR-0237 in the Relate repo).
+    Commits on clean exit; rolls back on ANY exception — including the
+    SystemExit fail() raises — so a refused statement costs zero writes
+    instead of a partial batch (the D-05 / usage-audit D1 fix)."""
+    base = graph["apiBase"].rstrip("/") + QUERY_PATH
+    try:
+        status, payload = _raw_post(base + "/tx", {}, timeout=15)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        fail(
+            f"cannot open a managed transaction on graph '{graph['slug']}' "
+            f"({exc}). Recovery: {recovery_hint(graph)}"
+        )
+    tx = payload.get("transaction") if isinstance(payload, dict) else None
+    if status not in (200, 201) or not tx or not tx.get("id"):
+        fail(
+            f"could not open a managed transaction on graph '{graph['slug']}': "
+            f"HTTP {status}: {str(payload)[:300]}"
+        )
+    entry = (graph["slug"], tx["id"])
+    _TX_STACK.append(entry)
+    try:
+        yield tx["id"]
+    except BaseException:
+        if entry in _TX_STACK:
+            _TX_STACK.remove(entry)
+        try:
+            _raw_post(f"{base}/tx/{tx['id']}", None, timeout=10, method="DELETE")
+        except Exception:
+            pass
+        raise
+    if entry in _TX_STACK:
+        _TX_STACK.remove(entry)
+    try:
+        status, payload = _raw_post(f"{base}/tx/{tx['id']}/commit", {}, timeout=30)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        fail(
+            f"commit of transaction {tx['id']} on graph '{graph['slug']}' "
+            f"could not be confirmed ({exc}) — the writes may or may not "
+            "have applied; re-check the graph before retrying"
+        )
+    if status >= 400:
+        fail(
+            f"commit of transaction {tx['id']} on graph '{graph['slug']}' "
+            f"failed with HTTP {status}: {str(payload)[:300]} — nothing applied"
+        )
+
+
+def run_query(graph, statement, parameters=None, timeout=15):
+    """POST one Cypher statement to the graph's Query API. Returns (fields, values).
+    Routes into the open managed transaction for this graph when one exists."""
+    base = graph["apiBase"].rstrip("/") + QUERY_PATH
+    tx_id = _open_tx_id(graph)
+    url = f"{base}/tx/{tx_id}" if tx_id else base
+    try:
+        status, payload = _raw_post(
+            url, {"statement": statement, "parameters": parameters or {}},
+            timeout=timeout,
+        )
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        fail(f"cannot reach graph '{graph['slug']}' at {url} ({exc}). Recovery: {recovery_hint(graph)}")
+    if status >= 400 or not isinstance(payload, dict) or "data" not in payload:
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if errors:
+            first = errors[0]
+            fail(f"query rejected by graph '{graph['slug']}': [{first.get('code')}] {first.get('message')}")
+        fail(f"query to graph '{graph['slug']}' failed with HTTP {status}: {str(payload)[:300]}")
+    data = payload.get("data") or {}
+    return data.get("fields", []), data.get("values", [])
+
+
+def rows_as_dicts(fields, values):
+    return [dict(zip(fields, row)) for row in values]
+
+
+def print_json(value):
+    print(json.dumps(value, indent=2, default=str))
+
+
+def cmd_graphs(_args):
+    result = []
+    for graph in registry_graphs():
+        result.append(
+            {
+                "slug": graph.get("slug"),
+                "name": graph.get("name"),
+                "port": graph.get("port"),
+                "apiBase": graph.get("apiBase"),
+                "status": graph.get("status"),
+                "service": graph.get("service"),
+                "store": graph.get("store"),
+            }
+        )
+    print_json(result)
+
+
+def cmd_status(_args):
+    result = []
+    for graph in registry_graphs():
+        entry = {
+            "slug": graph.get("slug"),
+            "port": graph.get("port"),
+            "apiBase": graph.get("apiBase"),
+            "registryStatus": graph.get("status"),
+            "reachable": False,
+            "nodes": None,
+        }
+        url = graph["apiBase"].rstrip("/") + QUERY_PATH
+        body = json.dumps({"statement": "MATCH (n) RETURN count(n) AS c", "parameters": {}}).encode()
+        request = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode())
+            entry["reachable"] = True
+            entry["nodes"] = payload["data"]["values"][0][0]
+        except Exception as exc:  # status reports, never crashes
+            entry["error"] = f"{exc}. Recovery: {recovery_hint(graph)}"
+        result.append(entry)
+    print_json(result)
+
+
+def cmd_counts(args):
+    graph = resolve_graph(args[0])
+    _, node_values = run_query(graph, "MATCH (n) RETURN count(n) AS nodes")
+    _, edge_values = run_query(graph, "MATCH ()-[r]->() RETURN count(r) AS edges")
+    print_json(
+        {
+            "graph": graph["slug"],
+            "nodes": node_values[0][0],
+            "edges": edge_values[0][0],
+        }
+    )
+
+
+def cmd_labels(args):
+    graph = resolve_graph(args[0])
+    fields, values = run_query(
+        graph,
+        "MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS count ORDER BY count DESC",
+    )
+    print_json({"graph": graph["slug"], "labels": rows_as_dicts(fields, values)})
+
+
+def cmd_types(args):
+    graph = resolve_graph(args[0])
+    fields, values = run_query(
+        graph,
+        "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC",
+    )
+    print_json({"graph": graph["slug"], "types": rows_as_dicts(fields, values)})
+
+
+def cmd_node(args):
+    graph = resolve_graph(args[0])
+    slug = args[1]
+    fields, values = run_query(
+        graph,
+        "MATCH (n {slug: $slug}) RETURN n",
+        parameters={"slug": slug},
+    )
+    if not values:
+        fail(f"no node with slug '{slug}' in graph '{graph['slug']}'", code=3)
+    node = values[0][0]
+    properties = dict(node.get("properties", {}))
+    embedding = properties.pop("embedding", None)
+    if embedding is not None:
+        properties["embedding"] = f"<{len(embedding)}-dim vector omitted>"
+    _, count_values = run_query(
+        graph,
+        "MATCH (n {slug: $slug})-[r]-(m) RETURN count(DISTINCT m) AS neighbors",
+        parameters={"slug": slug},
+    )
+    nfields, nvalues = run_query(
+        graph,
+        "MATCH (n {slug: $slug})-[r]-(m) "
+        "RETURN type(r) AS rel, m.slug AS slug, labels(m) AS labels "
+        f"ORDER BY rel, slug LIMIT {NEIGHBOR_LIMIT + 1}",
+        parameters={"slug": slug},
+    )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "slug": slug,
+            "labels": node.get("labels", []),
+            "properties": properties,
+            "neighborCount": count_values[0][0],
+            "neighbors": rows_as_dicts(nfields, nvalues)[:NEIGHBOR_LIMIT],
+            "neighborsTruncated": len(nvalues) > NEIGHBOR_LIMIT,
+        }
+    )
+
+
+def cmd_query(args):
+    graph = resolve_graph(args[0])
+    fields, values = run_query(graph, args[1])
+    print_json({"graph": graph["slug"], "fields": fields, "rows": values})
+
+
+def cmd_signals(args):
+    graph = resolve_graph(args[0])
+    fields, values = run_query(
+        graph,
+        "MATCH (n:SpaceSignal) "
+        "RETURN n.kind AS kind, n.refId AS refId, n.graphSlug AS graphSlug, "
+        "n.at AS at, n.consumed AS consumed ORDER BY at",
+    )
+    # A graph with no SpaceSignal label yet returns zero rows, not an error.
+    print_json({"graph": graph["slug"], "signals": rows_as_dicts(fields, values)})
+
+
+# --- Engine schema DDL (usage-audit fix D2/D3/D4) ---------------------------
+# Slug integrity belongs to the engine, not to post-hoc scans: a UNIQUE
+# constraint per content label (its backing RANGE index serves slug
+# lookups), a plain slug index for the bookkeeping labels (Decision /
+# ReviewItem keep plain indexes on purpose — their ids are allocated by
+# the D-06 count+renumber flow, which a constraint would turn into a
+# hard failure), a VECTOR INDEX per content label, and one FULLTEXT
+# INDEX over the searchable text properties. apply_schema_ddl is
+# idempotent: it inspects SHOW INDEXES / SHOW CONSTRAINTS and creates
+# only what is missing.
+DDL_CONSTRAINT_LABELS = CONTENT_LABELS + ("Question",)
+DDL_INDEX_LABELS = (
+    "Ontology", "OntologyClass", "OntologyProperty",
+    "Decision", "ReviewItem", "SpaceSignal",
+)
+FULLTEXT_INDEX_NAME = "node_text"
+FULLTEXT_PROPS = ("name", "summary", "alias", "legalName", "normalizedName")
+
+
+def _ddl_plan():
+    """(kind, name, statement) for every schema object this layer owns."""
+    plan = []
+    for label in DDL_CONSTRAINT_LABELS:
+        name = f"{label.lower()}_slug_unique"
+        plan.append((
+            "constraint", name,
+            f"CREATE CONSTRAINT {name} FOR (n:{label}) REQUIRE n.slug IS UNIQUE",
+        ))
+    for label in DDL_INDEX_LABELS:
+        name = f"{label.lower()}_slug_idx"
+        plan.append((
+            "index", name, f"CREATE INDEX {name} FOR (n:{label}) ON (n.slug)",
+        ))
+    for label in CONTENT_LABELS:
+        name = f"{label.lower()}_embedding"
+        plan.append((
+            "vector-index", name,
+            f"CREATE VECTOR INDEX {name} FOR (n:{label}) ON (n.embedding)",
+        ))
+    labels = "n:" + "|".join(CONTENT_LABELS)
+    props = ", ".join(f"n.{p}" for p in FULLTEXT_PROPS)
+    plan.append((
+        "fulltext-index", FULLTEXT_INDEX_NAME,
+        f"CREATE FULLTEXT INDEX {FULLTEXT_INDEX_NAME} FOR ({labels}) "
+        f"ON EACH [{props}]",
+    ))
+    return plan
+
+
+def apply_schema_ddl(graph):
+    """Create any missing schema objects; returns {created, existing}.
+    A creation the engine refuses (e.g. a UNIQUE constraint over
+    pre-existing duplicate slugs) fails the command with the engine's
+    error — that refusal IS the preventive control working."""
+    _, iv = run_query(graph, "SHOW INDEXES")
+    index_names = {row[1] for row in iv}
+    _, cv = run_query(graph, "SHOW CONSTRAINTS")
+    constraint_names = {row[1] for row in cv}
+    created, existing = [], []
+    for kind, name, statement in _ddl_plan():
+        if name in index_names or name in constraint_names:
+            existing.append(name)
+            continue
+        run_query(graph, statement)
+        created.append(name)
+    return {"created": created, "existing": existing}
+
+
+def cmd_ddl(args):
+    if len(args) == 2 and args[0] == "--api-base":
+        graph = {"slug": "(unregistered)", "apiBase": args[1]}
+    elif len(args) == 1:
+        graph = resolve_graph(args[0])
+    else:
+        fail("usage: relate ddl <graph> | relate ddl --api-base <url>", code=2)
+    result = apply_schema_ddl(graph)
+    print_json({"graph": graph["slug"], "apiBase": graph["apiBase"], **result})
+
+
+def cmd_provision(args):
+    slug = args[0]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug):
+        fail(f"invalid slug '{slug}'. Use lowercase letters, digits and hyphens.", code=2)
+    existing = [g.get("slug") for g in registry_graphs()]
+    if slug in existing:
+        fail(f"graph '{slug}' is already registered. Valid slugs: {', '.join(sorted(existing))}", code=2)
+    if not os.path.isfile(PROVISION_SCRIPT):
+        fail(f"provisioning script not found at {PROVISION_SCRIPT}")
+    result = subprocess.run(
+        ["bash", PROVISION_SCRIPT, slug],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        fail(f"provisioning script failed for slug '{slug}' with exit code {result.returncode}")
+    refreshed = [g for g in registry_graphs() if g.get("slug") == slug]
+    if refreshed:
+        print_json({"provisioned": refreshed[0]})
+
+
+# ---------------------------------------------------------------------------
+# Deterministic tool layer: shared helpers
+# ---------------------------------------------------------------------------
+
+def graph_counts(graph):
+    _, nv = run_query(graph, "MATCH (n) RETURN count(n) AS c")
+    _, ev = run_query(graph, "MATCH ()-[r]->() RETURN count(r) AS c")
+    return nv[0][0], ev[0][0]
+
+
+def fetch_nodes(graph, label, where=""):
+    _, values = run_query(graph, f"MATCH (n:{label}) {where} RETURN n")
+    return [row[0] for row in values]
+
+
+def fetch_node_by_slug(graph, slug):
+    _, values = run_query(
+        graph, "MATCH (n {slug: $slug}) RETURN n", parameters={"slug": slug}
+    )
+    return values[0][0] if values else None
+
+
+def kebab(name):
+    step = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name)
+    step = re.sub(r"[\s_]+", "-", step)
+    return step.lower()
+
+
+def identity_slug(name):
+    """Deterministic node identity from a name — Cognee's
+    generate_node_id normalization (lowercase, strip apostrophes)
+    adapted to our hyphen slug scheme: punctuation becomes spaces,
+    whitespace runs become single hyphens. The same entity name always
+    yields the same slug, so the same entity written from two documents
+    MERGEs onto one node at write time — identity by construction.
+    Anything fuzzier than this exact normalization stays evidence-only
+    (normalize-scan candidates + the merge tool), never a write-time
+    guess."""
+    step = str(name).lower().replace("'", "").replace("’", "")
+    step = re.sub(r"[^a-z0-9\s-]", " ", step)
+    step = re.sub(r"[\s_]+", "-", step).strip("-")
+    return re.sub(r"-+", "-", step)
+
+
+def local_name(uri):
+    return re.split(r"[#/]", uri)[-1]
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def apply_props(graph, match_clause, match_params, props, var="n"):
+    """SET the given properties on whatever match_clause matches."""
+    keys = [k for k in props if _IDENT_RE.match(k)]
+    if not keys:
+        return
+    assignments = ", ".join(f"{var}.{k} = $v_{k}" for k in keys)
+    params = dict(match_params)
+    for k in keys:
+        params[f"v_{k}"] = props[k]
+    run_query(graph, f"{match_clause} SET {assignments}", parameters=params)
+
+
+def duplicate_term_names(graph, label):
+    _, values = run_query(
+        graph,
+        f"MATCH (x:{label}) WHERE x.name IS NOT NULL "
+        "WITH x.name AS name, count(*) AS c WHERE c > 1 RETURN name ORDER BY name",
+    )
+    return [row[0] for row in values]
+
+
+def stamped_terms(graph):
+    """(class names, object property names, datatype property names) stamped in-graph."""
+    classes = set()
+    for node in fetch_nodes(graph, "OntologyClass"):
+        name = node.get("properties", {}).get("name")
+        if name:
+            classes.add(name)
+    obj_props, data_props = set(), set()
+    for node in fetch_nodes(graph, "OntologyProperty"):
+        props = node.get("properties", {})
+        if props.get("name") and props.get("kind") == "object":
+            obj_props.add(props["name"])
+        elif props.get("name") and props.get("kind") == "datatype":
+            data_props.add(props["name"])
+    return classes, obj_props, data_props
+
+
+# ---------------------------------------------------------------------------
+# Ontology file parsers (stdlib only). Each returns
+# {"ontology": {...}, "classes": [{name, ...}], "properties": [{name, kind, ...}]}
+# with terms deduplicated by name (first declaration wins) and sorted by name.
+# ---------------------------------------------------------------------------
+
+def _ttl_tokens(text):
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif ch == "<":
+            j = text.index(">", i)
+            tokens.append(("IRI", text[i + 1:j]))
+            i = j + 1
+        elif ch == '"':
+            if text.startswith('"""', i):
+                j = i + 3
+                buf = []
+                while j < n and not text.startswith('"""', j):
+                    if text[j] == "\\" and j + 1 < n:
+                        buf.append(text[j + 1])
+                        j += 2
+                    else:
+                        buf.append(text[j])
+                        j += 1
+                tokens.append(("STRING", "".join(buf)))
+                i = j + 3
+            else:
+                j = i + 1
+                buf = []
+                while j < n and text[j] != '"':
+                    if text[j] == "\\" and j + 1 < n:
+                        esc = text[j + 1]
+                        buf.append({"n": "\n", "t": "\t", "r": "\r"}.get(esc, esc))
+                        j += 2
+                    else:
+                        buf.append(text[j])
+                        j += 1
+                tokens.append(("STRING", "".join(buf)))
+                i = j + 1
+            if text.startswith("^^", i):
+                i += 2
+                while i < n and not text[i].isspace() and text[i] not in ";,.":
+                    i += 1
+            elif i < n and text[i] == "@":
+                while i < n and (text[i].isalnum() or text[i] in "@-"):
+                    i += 1
+        elif ch in ";,.[]()":
+            tokens.append((ch, ch))
+            i += 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in ";,.[]()":
+                j += 1
+            tokens.append(("WORD", text[i:j]))
+            i = j
+    return tokens
+
+
+def _skip_block(tokens, pos, open_ch, close_ch):
+    depth = 0
+    while pos < len(tokens):
+        kind = tokens[pos][0]
+        if kind == open_ch:
+            depth += 1
+        elif kind == close_ch:
+            depth -= 1
+            if depth == 0:
+                return pos + 1
+        pos += 1
+    return pos
+
+
+def parse_turtle(path):
+    """Minimal Turtle reader: prefixes, named-subject triples, no blank-node internals."""
+    with open(path, encoding="utf-8") as handle:
+        tokens = _ttl_tokens(handle.read())
+    prefixes = {}
+    triples = []
+
+    def expand(word):
+        if ":" in word:
+            pfx, local = word.split(":", 1)
+            if pfx in prefixes:
+                return prefixes[pfx] + local
+        return word
+
+    pos = 0
+    while pos < len(tokens):
+        kind, val = tokens[pos]
+        if kind == "WORD" and val in ("@prefix", "@base"):
+            if val == "@prefix" and pos + 2 < len(tokens):
+                prefixes[tokens[pos + 1][1].rstrip(":")] = tokens[pos + 2][1]
+            pos += 4
+            continue
+        if kind == "[":
+            pos = _skip_block(tokens, pos, "[", "]")
+            subject = None
+        elif kind in ("IRI", "WORD"):
+            subject = val if kind == "IRI" else expand(val)
+            pos += 1
+        else:
+            pos += 1
+            continue
+        while pos < len(tokens):
+            pkind, pval = tokens[pos]
+            if pkind == ".":
+                pos += 1
+                break
+            if pkind not in ("WORD", "IRI"):
+                pos += 1
+                continue
+            predicate = (
+                RDF_NS + "type" if pval == "a"
+                else (pval if pkind == "IRI" else expand(pval))
+            )
+            pos += 1
+            while pos < len(tokens):
+                okind, oval = tokens[pos]
+                if okind == "[":
+                    pos = _skip_block(tokens, pos, "[", "]")
+                    obj = ("BLANK", None)
+                elif okind == "(":
+                    pos = _skip_block(tokens, pos, "(", ")")
+                    obj = ("BLANK", None)
+                elif okind == "IRI":
+                    obj = ("URI", oval)
+                    pos += 1
+                elif okind == "STRING":
+                    obj = ("LIT", oval)
+                    pos += 1
+                elif okind == "WORD":
+                    obj = ("URI", expand(oval))
+                    pos += 1
+                else:
+                    obj = ("BLANK", None)
+                    pos += 1
+                if subject is not None:
+                    triples.append((subject, predicate, obj))
+                if pos < len(tokens) and tokens[pos][0] == ",":
+                    pos += 1
+                    continue
+                break
+            if pos < len(tokens) and tokens[pos][0] == ";":
+                pos += 1
+                continue
+            if pos < len(tokens) and tokens[pos][0] == ".":
+                pos += 1
+            break
+    return prefixes, triples
+
+
+def _compress_uri(uri, prefixes):
+    best = None
+    for pfx, ns in prefixes.items():
+        if uri.startswith(ns) and (best is None or len(ns) > len(best[1])):
+            best = (pfx, ns)
+    if best:
+        return f"{best[0]}:{uri[len(best[1]):]}"
+    return local_name(uri)
+
+
+def _maps_to_string(relations, prefixes):
+    groups = []
+    for rel in ("subClassOf", "subPropertyOf", "seeAlso"):
+        shorts = [
+            _compress_uri(uri, prefixes) for r, uri in relations if r == rel
+        ]
+        if shorts:
+            groups.append(", ".join(shorts) + f" ({rel})")
+    return "; ".join(groups) if groups else None
+
+
+def _terms_from_triples(triples, prefixes, house=False):
+    kinds, comments, relations = {}, {}, {}
+    ontology = {}
+    for subj, pred, obj in triples:
+        if pred == RDF_NS + "type" and obj[0] == "URI":
+            if obj[1] in _TYPE_KIND_BY_URI:
+                kinds.setdefault(subj, _TYPE_KIND_BY_URI[obj[1]])
+            elif obj[1] == OWL_NS + "Ontology":
+                ontology["uri"] = subj
+        elif pred == RDFS_NS + "comment" and obj[0] == "LIT":
+            comments[subj] = obj[1]
+        elif pred in _REL_BY_URI and obj[0] == "URI":
+            relations.setdefault(subj, []).append((_REL_BY_URI[pred], obj[1]))
+        elif pred in (DCTERMS_NS + "title", DC_NS + "title") and obj[0] == "LIT":
+            ontology.setdefault("title", obj[1])
+        elif pred == OWL_NS + "versionInfo" and obj[0] == "LIT":
+            ontology.setdefault("version", obj[1])
+        elif pred == RDFS_NS + "label" and obj[0] == "LIT" and subj == ontology.get("uri"):
+            ontology.setdefault("title", obj[1])
+    classes, properties = [], []
+    seen = set()
+    for uri, kind in kinds.items():
+        name = local_name(uri)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        term = {"name": name, "kind": kind}
+        if house:
+            term["mapsTo"] = _maps_to_string(relations.get(uri, []), prefixes)
+            if kind == "datatype":
+                match = re.search(
+                    r"Graph key:\s*([A-Za-z_][A-Za-z0-9_]*)", comments.get(uri, "")
+                )
+                term["graphKey"] = match.group(1) if match else name
+        if kind == "class":
+            classes.append(term)
+        else:
+            properties.append(term)
+    classes.sort(key=lambda t: t["name"])
+    properties.sort(key=lambda t: t["name"])
+    return ontology, classes, properties
+
+
+def parse_rdfxml(path):
+    tree = ET.parse(path)
+    root = tree.getroot()
+    about_attr = f"{{{RDF_NS}}}about"
+    type_tag = f"{{{RDF_NS}}}type"
+    resource_attr = f"{{{RDF_NS}}}resource"
+    kinds = {}
+    ontology = {}
+    for el in root.iter():
+        if el.tag == f"{{{OWL_NS}}}Ontology":
+            for child in el:
+                if child.tag in (
+                    f"{{{DCTERMS_NS}}}title", f"{{{DC_NS}}}title", f"{{{RDFS_NS}}}label",
+                ) and child.text:
+                    ontology.setdefault("title", child.text.strip())
+                if child.tag == f"{{{OWL_NS}}}versionInfo" and child.text:
+                    ontology.setdefault("version", child.text.strip())
+            continue
+        about = el.get(about_attr)
+        if not about:
+            continue
+        kind = _XML_TAG_KIND.get(el.tag)
+        if kind is None and el.tag == f"{{{RDF_NS}}}Description":
+            for child in el:
+                if child.tag == type_tag:
+                    res = child.get(resource_attr)
+                    if res in _TYPE_KIND_BY_URI:
+                        kind = _TYPE_KIND_BY_URI[res]
+                        break
+        if kind:
+            kinds.setdefault(about, kind)
+    classes, properties = [], []
+    seen = set()
+    for uri, kind in kinds.items():
+        name = local_name(uri)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        term = {"name": name, "kind": kind}
+        if kind == "class":
+            classes.append(term)
+        else:
+            properties.append(term)
+    classes.sort(key=lambda t: t["name"])
+    properties.sort(key=lambda t: t["name"])
+    return ontology, classes, properties
+
+
+def parse_jsonld(path):
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    entries = data.get("@graph", [])
+    kinds = {}
+    for wanted, kind in (("rdfs:Class", "class"), ("rdf:Property", "property")):
+        for entry in entries:
+            types = entry.get("@type", [])
+            if isinstance(types, str):
+                types = [types]
+            if wanted not in types:
+                continue
+            eid = entry.get("@id", "")
+            name = eid.split(":", 1)[-1] if eid.startswith("schema:") else local_name(eid)
+            if name:
+                kinds.setdefault(name, kind)
+    classes = [{"name": n, "kind": "class"} for n, k in kinds.items() if k == "class"]
+    properties = [
+        {"name": n, "kind": "property"} for n, k in kinds.items() if k == "property"
+    ]
+    classes.sort(key=lambda t: t["name"])
+    properties.sort(key=lambda t: t["name"])
+    return {}, classes, properties
+
+
+def parse_ontology(vocab_key):
+    spec = VOCABS[vocab_key]
+    path = os.path.join(ONTOLOGIES_DIR, spec["file"])
+    if not os.path.isfile(path):
+        fail(f"ontology file not found: {path}")
+    if spec["format"] == "turtle":
+        prefixes, triples = parse_turtle(path)
+        ontology, classes, properties = _terms_from_triples(
+            triples, prefixes, house=(vocab_key == "house")
+        )
+        if vocab_key == "house" and prefixes.get("hmg"):
+            ontology["uri"] = prefixes["hmg"]
+    elif spec["format"] == "rdfxml":
+        ontology, classes, properties = parse_rdfxml(path)
+    else:
+        ontology, classes, properties = parse_jsonld(path)
+    meta = {
+        "slug": spec["slug"],
+        "name": ontology.get("title") or spec["name"],
+        "version": ontology.get("version"),
+        "namespace": ontology.get("uri") or spec["namespace"],
+        "sourceFile": path,
+    }
+    return {"meta": meta, "classes": classes, "properties": properties, "scope": "full"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: stamp / reconcile / scan-conflicts / embed-missing / verify
+# ---------------------------------------------------------------------------
+
+def _default_term_slug(label, term):
+    if label == "OntologyClass":
+        return "class-" + kebab(term["name"])
+    return "prop-" + kebab(term["name"])
+
+
+def _stamp_terms(graph, meta, label, edge_type, terms, existing):
+    if not terms:
+        return
+    oid = meta["slug"]
+    rows = []
+    for term in terms:
+        prior = existing.get((label, term["name"]), {})
+        defined = set(prior.get("definedBy") or [])
+        defined.add(oid)
+        row = {
+            "name": term["name"],
+            "slug": prior.get("slug") or _default_term_slug(label, term),
+            "definedBy": sorted(defined),
+            "mapsTo": term.get("mapsTo"),
+        }
+        if label == "OntologyClass":
+            row["graphLabel"] = term["name"]
+        else:
+            row["kind"] = term["kind"]
+            if term["kind"] == "object":
+                row["graphType"] = term["name"]
+            if term.get("graphKey"):
+                row["graphKey"] = term["graphKey"]
+        rows.append(row)
+    keys = set()
+    for row in rows:
+        keys.update(row.keys())
+    keys.discard("name")
+    set_parts = []
+    for key in sorted(keys):
+        if key == "definedBy":
+            set_parts.append("c.definedBy = row.definedBy")
+        elif key == "mapsTo":
+            set_parts.append(
+                "c.mapsTo = CASE WHEN c.mapsTo IS NULL THEN row.mapsTo ELSE c.mapsTo END"
+            )
+        elif key == "slug":
+            set_parts.append(
+                "c.slug = CASE WHEN c.slug IS NULL THEN row.slug ELSE c.slug END"
+            )
+        else:
+            set_parts.append(
+                f"c.{key} = CASE WHEN c.{key} IS NULL THEN row.{key} ELSE c.{key} END"
+            )
+    run_query(
+        graph,
+        f"UNWIND $rows AS row MERGE (c:{label} {{name: row.name}}) SET "
+        + ", ".join(set_parts),
+        parameters={"rows": rows},
+    )
+    run_query(
+        graph,
+        f"MATCH (o:Ontology {{slug: $oid}}) UNWIND $names AS nm "
+        f"MATCH (c:{label} {{name: nm}}) MERGE (o)-[:{edge_type}]->(c)",
+        parameters={"oid": oid, "names": [t["name"] for t in terms]},
+    )
+
+
+_VOCAB_ALIASES = {
+    "house-memory-graph": "house",
+    "house memory graph": "house",
+    "schema.org": "schema-org",
+    "schemaorg": "schema-org",
+    "dublin core": "dcterms",
+    "dublin-core": "dcterms",
+    "dublin core terms": "dcterms",
+    "dc terms": "dcterms",
+    "w3c org": "org",
+    "w3c-org": "org",
+    "organization": "org",
+    "organizations": "org",
+    "prov": "prov-o",
+    "provenance": "prov-o",
+    "owl time": "owl-time",
+    "owltime": "owl-time",
+    "time ontology": "owl-time",
+    "friend of a friend": "foaf",
+}
+
+
+def normalize_vocab(raw):
+    """Resolve a user/preset-supplied ontology name to a VOCABS key.
+
+    Presets and pipeline prompts name ontologies in display forms
+    ('FOAF', 'Dublin Core', 'schema.org'); the stamp command used to
+    require the exact lowercase key and refused everything else."""
+    key = str(raw).strip().lower()
+    if key in VOCABS:
+        return key
+    return _VOCAB_ALIASES.get(key)
+
+
+def cmd_stamp(args):
+    graph = resolve_graph(args[0])
+    vocab_key = normalize_vocab(args[1])
+    if vocab_key is None:
+        fail(
+            f"unknown ontology '{args[1]}'. Valid: {', '.join(sorted(VOCABS))} "
+            "(display forms like 'FOAF', 'Dublin Core', 'schema.org' are accepted)",
+            code=2,
+        )
+    parsed = parse_ontology(vocab_key)
+    meta = parsed["meta"]
+    before = graph_counts(graph)
+    ont_props = {
+        "name": meta["name"],
+        "namespace": meta["namespace"],
+        "sourceFile": meta["sourceFile"],
+        "stampedAt": datetime.date.today().isoformat(),
+    }
+    if meta.get("version"):
+        ont_props["version"] = meta["version"]
+    apply_props(
+        graph, "MERGE (o:Ontology {slug: $slug})", {"slug": meta["slug"]},
+        ont_props, var="o",
+    )
+    existing = {}
+    for label in ("OntologyClass", "OntologyProperty"):
+        for node in fetch_nodes(graph, label):
+            props = node.get("properties", {})
+            if props.get("name"):
+                existing[(label, props["name"])] = props
+    # Pre-stamp snapshots: the ledger decision below fires on ANY real
+    # change — counts, term properties, or the Ontology node's own
+    # properties (stampedAt excluded; it changes by design every run).
+    before_terms = {key: dict(val) for key, val in existing.items()}
+    ontology_before = None
+    for node in fetch_nodes(graph, "Ontology"):
+        oprops = node.get("properties", {})
+        if oprops.get("slug") == meta["slug"]:
+            ontology_before = {k: v for k, v in oprops.items() if k != "stampedAt"}
+    _stamp_terms(graph, meta, "OntologyClass", "DEFINES_CLASS", parsed["classes"], existing)
+    _stamp_terms(
+        graph, meta, "OntologyProperty", "DEFINES_PROPERTY", parsed["properties"], existing
+    )
+    # Engine DDL rides along with stamping (usage-audit D2/D3/D4): a
+    # stamped graph carries its slug constraints and search indexes.
+    ddl = apply_schema_ddl(graph)
+    after = graph_counts(graph)
+    after_terms = {}
+    for label in ("OntologyClass", "OntologyProperty"):
+        for node in fetch_nodes(graph, label):
+            props = node.get("properties", {})
+            if props.get("name"):
+                after_terms[(label, props["name"])] = props
+    ontology_after = None
+    for node in fetch_nodes(graph, "Ontology"):
+        oprops = node.get("properties", {})
+        if oprops.get("slug") == meta["slug"]:
+            ontology_after = {k: v for k, v in oprops.items() if k != "stampedAt"}
+    decision = None
+    if after != before or after_terms != before_terms or ontology_after != ontology_before:
+        decision = logged_decision(
+            graph, f"stamp of ontology '{meta['slug']}'",
+            "stamp", meta["slug"],
+            {
+                "classes": len(parsed["classes"]),
+                "properties": len(parsed["properties"]),
+                "before": {"nodes": before[0], "edges": before[1]},
+                "after": {"nodes": after[0], "edges": after[1]},
+            },
+        )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "ontology": meta["slug"],
+            "scope": parsed["scope"],
+            "classes": len(parsed["classes"]),
+            "properties": len(parsed["properties"]),
+            "before": {"nodes": before[0], "edges": before[1]},
+            "after": {"nodes": after[0], "edges": after[1]},
+            "decision": decision,
+            "ddl": ddl,
+        }
+    )
+
+
+def _definers_by_node(graph, label, edge_type):
+    _, values = run_query(
+        graph,
+        f"MATCH (o:Ontology)-[:{edge_type}]->(x:{label}) "
+        "RETURN o.slug AS ont, elementId(x) AS eid",
+    )
+    result = {}
+    for ont, eid in values:
+        result.setdefault(eid, set()).add(ont)
+    return result
+
+
+def fetch_bookkeeping(graph, label):
+    """Bookkeeping nodes with FUNCTION-format elementIds.
+
+    The node objects the API returns carry a bare numeric elementId ("132"),
+    but elementId(x) in Cypher returns "4:rl-id:n132" — matching on the bare
+    form silently matches nothing. Always select elementId(n) explicitly.
+    """
+    _, values = run_query(
+        graph, f"MATCH (n:{label}) RETURN elementId(n) AS eid, n"
+    )
+    return [(row[0], row[1]) for row in values]
+
+
+def write_decision(graph, kind, subject, detail, extra=None, link_slug=None):
+    """Append one (:Decision) ledger node. Returns its slug (the decision id).
+
+    The sequential slug is allocated inside the create statement (the
+    count is read by the same statement that writes). Blast-tested
+    2026-11-16: this engine does NOT serialize count+create across
+    concurrent statements — 12 parallel writers minted only 7 unique
+    slugs — so the create is followed by a uniqueness check: on a
+    collision the writer renumbers its OWN node (matched by elementId)
+    to '<slug>-<elementId tail>', which is unique by construction. The
+    common path keeps the clean sequential slug; only a genuinely raced
+    entry carries the suffix. Residual: if Decision nodes were ever
+    deleted, a count-based slug could collide with a surviving one; the
+    ledger is append-only by contract and nothing here deletes Decisions."""
+    props = {
+        "kind": kind,
+        "subject": subject,
+        "detail": json.dumps(detail, default=str),
+        "at": now_utc(),
+    }
+    if extra:
+        props.update(extra)
+    keys = sorted(props)
+    assignments = ", ".join(f"n.{k} = $v_{k}" for k in keys)
+    params = {}
+    for k in keys:
+        params[f"v_{k}"] = props[k]
+    _, created = run_query(
+        graph,
+        "MATCH (d:Decision) WITH count(d) AS c "
+        "CREATE (n:Decision) SET n.slug = 'decision-' + "
+        "(CASE WHEN c < 9 THEN '000' WHEN c < 99 THEN '00' "
+        "WHEN c < 999 THEN '0' ELSE '' END) + toString(c + 1), "
+        f"{assignments} RETURN n.slug AS slug, elementId(n) AS eid",
+        parameters=params,
+    )
+    slug, eid = created[0][0], created[0][1]
+    _, dup = run_query(
+        graph,
+        "MATCH (d:Decision {slug: $slug}) RETURN count(d) AS c",
+        parameters={"slug": slug},
+    )
+    if dup[0][0] > 1:
+        tail = re.sub(r"[^A-Za-z0-9]", "", str(eid))[-8:] or "x"
+        slug = f"{slug}-{tail}"
+        run_query(
+            graph,
+            "MATCH (n) WHERE elementId(n) = $eid SET n.slug = $slug",
+            parameters={"eid": eid, "slug": slug},
+        )
+    if link_slug:
+        run_query(
+            graph,
+            "MATCH (d:Decision {slug: $d}) MATCH (n {slug: $n}) "
+            "MERGE (d)-[:DECISION]->(n)",
+            parameters={"d": slug, "n": link_slug},
+        )
+    return slug
+
+
+def logged_decision(graph, mutation, *args, **kwargs):
+    """write_decision for callers whose mutation has ALREADY landed.
+
+    If the ledger write fails here, the graph changed without a record —
+    report exactly that, naming the mutation, instead of surfacing a bare
+    query error that invites a blind retry of an applied change."""
+    try:
+        return write_decision(graph, *args, **kwargs)
+    except SystemExit:
+        if _open_tx_id(graph):
+            # Inside a managed transaction the mutation rolls back with
+            # the failed ledger write — nothing landed, so the original
+            # error is the honest report, not an unlogged-change warning.
+            raise
+        fail(
+            f"UNLOGGED CHANGE: {mutation} was applied to graph "
+            f"'{graph['slug']}' but its Decision ledger entry could not be "
+            "written. The graph changed without a ledger record — do not "
+            "retry blindly; inspect the graph state first."
+        )
+
+
+def cmd_reconcile(args):
+    graph = resolve_graph(args[0])
+    before = graph_counts(graph)
+    merged, unresolved = [], []
+    for label, edge_type in (
+        ("OntologyClass", "DEFINES_CLASS"),
+        ("OntologyProperty", "DEFINES_PROPERTY"),
+    ):
+        entries = fetch_bookkeeping(graph, label)
+        definers = _definers_by_node(graph, label, edge_type)
+        groups = {}
+        for eid, node in entries:
+            name = node.get("properties", {}).get("name")
+            if name:
+                groups.setdefault(name, []).append((eid, node))
+        for name in sorted(groups):
+            members = groups[name]
+            if len(members) < 2:
+                continue
+            members.sort(
+                key=lambda pair: (
+                    pair[1].get("properties", {}).get("slug") or "",
+                    pair[0],
+                )
+            )
+            survivor_eid, survivor = members[0]
+            survivor_props = dict(survivor.get("properties", {}))
+            maps_values = []
+            defined = set(survivor_props.get("definedBy") or [])
+            for eid, member in members:
+                defined |= definers.get(eid, set())
+                defined |= set(member.get("properties", {}).get("definedBy") or [])
+            for eid, member in members:
+                mprops = member.get("properties", {})
+                if mprops.get("mapsTo") and mprops["mapsTo"] not in maps_values:
+                    maps_values.append(mprops["mapsTo"])
+                for key, val in mprops.items():
+                    if key in ("mapsTo", "definedBy"):
+                        continue
+                    if survivor_props.get(key) is None and val is not None:
+                        survivor_props[key] = val
+            if maps_values:
+                survivor_props["mapsTo"] = " ; ".join(maps_values)
+            survivor_props["definedBy"] = sorted(defined)
+            apply_props(
+                graph, "MATCH (x) WHERE elementId(x) = $eid",
+                {"eid": survivor_eid}, survivor_props, var="x",
+            )
+            for ont_slug in sorted(defined):
+                run_query(
+                    graph,
+                    f"MATCH (o:Ontology {{slug: $oid}}) MATCH (x) "
+                    f"WHERE elementId(x) = $eid MERGE (o)-[:{edge_type}]->(x)",
+                    parameters={"oid": ont_slug, "eid": survivor_eid},
+                )
+            removed = []
+            delete_failed = False
+            for loser_eid, loser in members[1:]:
+                _, dv = run_query(
+                    graph,
+                    "MATCH (x) WHERE elementId(x) = $eid DETACH DELETE x "
+                    "RETURN count(*) AS c",
+                    parameters={"eid": loser_eid},
+                )
+                if not dv or dv[0][0] != 1:
+                    delete_failed = True
+                removed.append(loser.get("properties", {}).get("slug"))
+            _, nv = run_query(
+                graph,
+                f"MATCH (x:{label} {{name: $name}}) RETURN count(x) AS c",
+                parameters={"name": name},
+            )
+            if nv[0][0] == 1 and not delete_failed:
+                merged.append(
+                    {
+                        "name": name,
+                        "kept": survivor_props.get("slug"),
+                        "removed": removed,
+                    }
+                )
+            else:
+                unresolved.append(
+                    {
+                        "name": name,
+                        "reason": f"{nv[0][0]} node(s) with this name remain after reconcile",
+                    }
+                )
+    after = graph_counts(graph)
+    decision = None
+    if merged:
+        decision = logged_decision(
+            graph, "reconcile of duplicate ontology bookkeeping",
+            "reconcile", graph["slug"],
+            {
+                "merged": [m["name"] for m in merged],
+                "unresolved": unresolved,
+                "before": {"nodes": before[0], "edges": before[1]},
+                "after": {"nodes": after[0], "edges": after[1]},
+            },
+        )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "merged": merged,
+            "unresolved": unresolved,
+            "before": {"nodes": before[0], "edges": before[1]},
+            "after": {"nodes": after[0], "edges": after[1]},
+            "decision": decision,
+        }
+    )
+
+
+def build_scan(graph):
+    """The deterministic contradiction/conflict scan (read-only)."""
+    duplicate_classes = duplicate_term_names(graph, "OntologyClass")
+    duplicate_properties = duplicate_term_names(graph, "OntologyProperty")
+    _, values = run_query(
+        graph,
+        "MATCH (n) WHERE n.slug IS NOT NULL WITH n.slug AS slug, count(*) AS c "
+        "WHERE c > 1 RETURN slug, c ORDER BY slug",
+    )
+    duplicate_slugs = [{"slug": s, "count": c} for s, c in values]
+    contested = []
+    _, cvals = run_query(graph, "MATCH (n) WHERE n.contested = true RETURN n")
+    for row in cvals:
+        node = row[0]
+        props = node.get("properties", {})
+        contested.append(
+            {
+                "a": props.get("slug") or node.get("elementId"),
+                "b": props.get("contestedWith"),
+                "basis": props.get("contestedBasis")
+                or props.get("contestedReason")
+                or props.get("contestedNote"),
+            }
+        )
+    violations = []
+    for prop in SINGLE_VALUE_PROPS:
+        _, rows = run_query(
+            graph,
+            f"MATCH (n) WHERE n.{prop} IS NOT NULL AND n.retiredAt IS NULL "
+            f"RETURN elementId(n) AS eid, n.slug AS slug, n.{prop} AS val",
+        )
+        by_key = {}
+        for eid, slug, val in rows:
+            key = slug or eid
+            vals = val if isinstance(val, list) else [val]
+            by_key.setdefault(key, set()).update(str(v) for v in vals)
+        for key in sorted(by_key):
+            if len(by_key[key]) > 1:
+                violations.append(
+                    {"node": key, "property": prop, "values": sorted(by_key[key])}
+                )
+    violations.sort(key=lambda v: (v["node"], v["property"]))
+    # §6.5 kind 2 — conflicting edges: parallel LIVE edges of the same
+    # type between the same slugged pair whose qualifiers disagree.
+    # `fact` is the primary qualifier (two different non-empty fact
+    # sentences on one (from, type, to) cannot both be the fact that
+    # edge asserts); any other scalar qualifier counts too, minus the
+    # bitemporal / embedding / weight bookkeeping that legitimately
+    # differs between versions of an edge. Bookkeeping types are out
+    # of scope: parallel SUPERSEDED_BY links into one document (one
+    # per superseded property) are structural, not conflicts.
+    edge_conflicts = []
+    _, evals = run_query(
+        graph,
+        "MATCH (a)-[r]->(b) WHERE a.slug IS NOT NULL AND b.slug IS NOT NULL "
+        "AND r.retiredAt IS NULL RETURN a.slug, type(r), b.slug, r",
+    )
+    edge_groups = {}
+    for frm, etype, to, edge in evals:
+        if etype in ("DEFINES_CLASS", "DEFINES_PROPERTY", "DECISION",
+                     "SUPERSEDED_BY"):
+            continue
+        eprops = (edge or {}).get("properties", {})
+        edge_groups.setdefault((frm, etype, to), []).append(eprops)
+    edge_exempt = {
+        "recordedAt", "validFrom", "validTo", "retiredAt",
+        "fact_embedding", "fact_embedding_dim", "fact_embedding_model",
+        "fact_embedding_format", "feedback_weight", "importance_weight",
+        "supersedesFact",
+    }
+    for (frm, etype, to), group in sorted(edge_groups.items()):
+        if len(group) < 2:
+            continue
+        keys = set()
+        for eprops in group:
+            keys.update(eprops)
+        for key in sorted(keys):
+            if key in edge_exempt:
+                continue
+            vals = set()
+            for eprops in group:
+                val = eprops.get(key)
+                if val is None:
+                    continue
+                if isinstance(val, list):
+                    vals.update(str(v) for v in val)
+                else:
+                    vals.add(str(val))
+            if key == "fact":
+                vals = {v for v in vals if v.strip()}
+            if len(vals) > 1:
+                edge_conflicts.append(
+                    {
+                        "from": frm, "to": to, "type": etype,
+                        "property": key, "values": sorted(vals),
+                        "edges": len(group),
+                    }
+                )
+    # §6.5 kind 3 — identity conflicts: distinct live content nodes
+    # sharing a normalizedName while asserting different legalName
+    # values. Candidates for the §5 evidence ladder, reported only —
+    # a shared name with divergent legal names is evidence, never an
+    # auto-resolution.
+    identity_conflicts = []
+    _, ivals = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " AND n.retiredAt IS NULL "
+        "RETURN n",
+    )
+    by_norm = {}
+    for row in ivals:
+        props = row[0].get("properties", {})
+        slug = props.get("slug")
+        if not slug:
+            continue
+        norm = props.get("normalizedName") or _canonical(props.get("name") or "")
+        if not norm:
+            continue
+        by_norm.setdefault(norm, []).append(props)
+    for norm in sorted(by_norm):
+        group = by_norm[norm]
+        if len(group) < 2:
+            continue
+        legal = sorted({str(p["legalName"]) for p in group if p.get("legalName")})
+        if len(legal) > 1:
+            identity_conflicts.append(
+                {
+                    "normalizedName": norm,
+                    "nodes": sorted(p["slug"] for p in group),
+                    "legalNames": legal,
+                    "rule": "shared-normalizedName-divergent-legalName",
+                }
+            )
+    return {
+        "duplicateClasses": duplicate_classes,
+        "duplicateProperties": duplicate_properties,
+        "duplicateSlugs": duplicate_slugs,
+        "contested": contested,
+        "singleValueViolations": violations,
+        "edgeConflicts": edge_conflicts,
+        "identityConflicts": identity_conflicts,
+    }
+
+
+def cmd_scan_conflicts(args):
+    graph = resolve_graph(args[0])
+    scan = build_scan(graph)
+    print_json({"graph": graph["slug"], **scan})
+
+
+def _ollama_up():
+    try:
+        request = urllib.request.Request(OLLAMA_BASE + "/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def ensure_ollama():
+    if _ollama_up():
+        return
+    bin_path = os.path.join(RELATE_RUNTIME_DIR, "ollama", "bin", "ollama")
+    log_path = os.path.join(RELATE_RUNTIME_DIR, "logs", "ollama-serve.log")
+    env = dict(os.environ)
+    env["OLLAMA_MODELS"] = os.path.join(RELATE_RUNTIME_DIR, "models")
+    with open(log_path, "ab") as log:
+        subprocess.Popen(
+            [bin_path, "serve"], stdout=log, stderr=log, env=env,
+            start_new_session=True,
+        )
+    for _ in range(30):
+        if _ollama_up():
+            return
+        time.sleep(1)
+    fail(f"Ollama did not come up at {OLLAMA_BASE}; see {log_path}")
+
+
+def embed_text(text):
+    body = json.dumps({"model": EMBED_MODEL, "input": text}).encode()
+    request = urllib.request.Request(
+        OLLAMA_BASE + "/api/embed", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode())
+        return payload["embeddings"][0]
+    except Exception:
+        body = json.dumps({"model": EMBED_MODEL, "prompt": text}).encode()
+        request = urllib.request.Request(
+            OLLAMA_BASE + "/api/embeddings", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode())
+        return payload["embedding"]
+
+
+def compose_embed_text(props):
+    """Document-format embedding text (EmbeddingGemma 2 card):
+    'title: {title} | text: {content}' — the node's name is its title
+    ('none' when it has none); the content is summary-led, then the
+    identity fields, as before."""
+    name = props.get("name")
+    title = "none"
+    if name:
+        title = " ".join(str(name).replace("|", " ").split()) or "none"
+    parts = []
+    if props.get("summary"):
+        parts.append(str(props["summary"]))
+    for key in ("category", "legalName", "alias", "sourcePath"):
+        val = props.get(key)
+        if val:
+            if isinstance(val, list):
+                val = ", ".join(str(v) for v in val)
+            parts.append(f"{key}: {val}")
+    text = "\n".join(parts)
+    if not text:
+        text = str(props.get("slug") or name or "")
+    if not text:
+        return ""
+    return f"title: {title} | text: {text}"
+
+
+def cmd_embed_missing(args):
+    if not args:
+        fail("usage: relate embed-missing <graph> [--force]", code=2)
+    graph = resolve_graph(args[0])
+    extra = args[1:]
+    if extra not in ([], ["--force"]):
+        fail("usage: relate embed-missing <graph> [--force]", code=2)
+    force = extra == ["--force"]
+    _, hv = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "AND n.embedding IS NOT NULL RETURN count(n) AS c",
+    )
+    already = hv[0][0]
+    _, values = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        + ("" if force else "AND n.embedding IS NULL ") + "RETURN n",
+    )
+    nodes = [row[0] for row in values]
+    nodes.sort(key=lambda nd: nd.get("properties", {}).get("slug") or "")
+    embedded, failed = 0, []
+    if nodes:
+        ensure_ollama()
+    stamp = resolved_model_stamp()
+    for node in nodes:
+        props = node.get("properties", {})
+        slug = props.get("slug")
+        try:
+            if not slug:
+                raise ValueError("content node has no slug")
+            vec = embed_text(
+                compose_embed_text(props) or f"title: none | text: {slug}"
+            )
+            if len(vec) != EMBED_DIM:
+                raise ValueError(
+                    f"embedding has {len(vec)} dims, expected {EMBED_DIM}"
+                )
+            run_query(
+                graph,
+                "MATCH (n {slug: $slug}) SET n.embedding = $vec, "
+                "n.embedding_dim = $dim, n.embedding_model = $model, "
+                "n.embedding_format = $format",
+                parameters={
+                    "slug": slug, "vec": vec, "dim": EMBED_DIM,
+                    "model": stamp, "format": EMBED_FORMAT,
+                },
+            )
+            embedded += 1
+        except Exception as exc:  # per-node failure is data, not a crash
+            failed.append({"slug": slug, "error": str(exc)})
+    print_json(
+        {
+            "graph": graph["slug"],
+            "embedded": embedded,
+            "alreadyHad": already,
+            "force": force,
+            "model": stamp,
+            "format": EMBED_FORMAT,
+            "failed": failed,
+        }
+    )
+
+
+def cmd_verify(args):
+    graph = resolve_graph(args[0])
+    gates = {}
+
+    def gate(name, passed, detail):
+        gates[name] = {"passed": bool(passed), "detail": detail}
+
+    nodes, edges = graph_counts(graph)
+    gate("totals", True, {"nodes": nodes, "edges": edges})
+
+    _, lv = run_query(
+        graph,
+        "MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS c ORDER BY label",
+    )
+    labels = {row[0]: row[1] for row in lv}
+    bad_labels = sorted(set(labels) - ALLOWED_LABELS)
+    gate("label_census", not bad_labels, {"labels": labels, "unexpected": bad_labels})
+
+    _, tv = run_query(
+        graph, "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c ORDER BY t"
+    )
+    types = {row[0]: row[1] for row in tv}
+    bad_types = sorted(set(types) - ALLOWED_TYPES)
+    gate(
+        "type_census", not bad_types,
+        {"types": types, "unexpected": bad_types},
+    )
+
+    _, mv = run_query(
+        graph,
+        "MATCH (n) WHERE n.slug IS NULL AND NOT n:SpaceSignal RETURN count(n) AS c",
+    )
+    _, sv = run_query(graph, "MATCH (s:SpaceSignal) RETURN count(s) AS c")
+    gate(
+        "missing_slugs", mv[0][0] == 0,
+        {"missingExcludingSpaceSignal": mv[0][0], "spaceSignalNodes": sv[0][0]},
+    )
+
+    scan = build_scan(graph)
+    gate(
+        "duplicate_slugs", not scan["duplicateSlugs"],
+        {"duplicates": scan["duplicateSlugs"]},
+    )
+
+    _, cv = run_query(
+        graph,
+        "MATCH (n) WHERE n.category IS NULL AND " + _content_scope() + " "
+        "RETURN count(n) AS c",
+    )
+    gate("missing_category", cv[0][0] == 0, {"contentWithoutCategory": cv[0][0]})
+
+    _, kv = run_query(
+        graph,
+        "MATCH (n) WHERE n.category IS NOT NULL RETURN DISTINCT n.category AS category",
+    )
+    cats = sorted(row[0] for row in kv)
+    bad_cats = sorted(set(cats) - CATEGORY_VALUES)
+    gate("category_values", not bad_cats, {"inUse": cats, "unexpected": bad_cats})
+
+    _, nv = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "AND (n.normalizedSlug IS NULL OR n.normalizedSlug <> n.slug) RETURN count(n) AS c",
+    )
+    gate(
+        "normalization_consistency", nv[0][0] == 0,
+        {"contentScope": True, "inconsistent": nv[0][0]},
+    )
+
+    _, ev1 = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "AND n.embedding IS NULL RETURN count(n) AS c",
+    )
+    gate(
+        "embedding_coverage", ev1[0][0] == 0,
+        {"contentWithoutEmbedding": ev1[0][0]},
+    )
+
+    _, ev2 = run_query(
+        graph,
+        "MATCH (n) WHERE n.embedding IS NOT NULL RETURN DISTINCT "
+        "n.embedding_dim AS dim, n.embedding_model AS model, "
+        "n.embedding_format AS format",
+    )
+    pairs = [[row[0], row[1], row[2]] for row in ev2]
+    gate(
+        "embedding_uniformity", len(pairs) <= 1,
+        {"dimModelPairs": pairs},
+    )
+
+    _, bv = run_query(
+        graph,
+        "MATCH (n) WHERE (n.validFrom IS NOT NULL AND n.validTo IS NOT NULL "
+        "AND n.validTo < n.validFrom) OR (n.recordedAt IS NOT NULL "
+        "AND n.retiredAt IS NOT NULL AND n.retiredAt < n.recordedAt) RETURN count(n) AS c",
+    )
+    gate("bitemporal_sanity", bv[0][0] == 0, {"violations": bv[0][0]})
+
+    _, pv1 = run_query(
+        graph, "MATCH (d:SourceDocument) WHERE d.sourcePath IS NULL RETURN count(d) AS c"
+    )
+    _, pv2 = run_query(
+        graph,
+        "MATCH (d:SourceDocument) WHERE d.sourcePath IS NOT NULL "
+        "WITH d.sourcePath AS sp, count(*) AS c WHERE c > 1 RETURN sp, c",
+    )
+    gate(
+        "provenance", pv1[0][0] == 0 and not pv2,
+        {
+            "documentsMissingSourcePath": pv1[0][0],
+            "duplicateSourcePaths": [{"sourcePath": r[0], "count": r[1]} for r in pv2],
+        },
+    )
+
+    _, iv = run_query(
+        graph,
+        "MATCH (n) WHERE NOT (n)--() AND NOT n:SpaceSignal "
+        "AND NOT n:Decision AND NOT n:ReviewItem AND NOT n:Question "
+        "RETURN count(n) AS c",
+    )
+    gate(
+        "isolated_nodes", iv[0][0] == 0,
+        {"isolatedExcludingControlPlane": iv[0][0]},
+    )
+
+    _, gv = run_query(
+        graph, "MATCH (d:SourceDocument) RETURN count(d) AS docs, "
+        "sum(CASE WHEN d.summary IS NULL THEN 1 ELSE 0 END) AS without",
+    )
+    gate(
+        "summary_gap", True,
+        {"documents": gv[0][0], "withoutSummary": gv[0][1], "blocking": False},
+    )
+
+    _, mv2 = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "AND n.community IS NULL RETURN count(n) AS c",
+    )
+    gate(
+        "community_coverage", mv2[0][0] == 0,
+        {"contentWithoutCommunity": mv2[0][0]},
+    )
+
+    _, tv2 = run_query(
+        graph,
+        "MATCH (n) RETURN sum(CASE WHEN n.validFrom IS NOT NULL THEN 1 ELSE 0 END) AS vf, "
+        "sum(CASE WHEN n.validTo IS NOT NULL THEN 1 ELSE 0 END) AS vt, "
+        "sum(CASE WHEN n.recordedAt IS NOT NULL THEN 1 ELSE 0 END) AS ra, "
+        "sum(CASE WHEN n.retiredAt IS NOT NULL THEN 1 ELSE 0 END) AS rt",
+    )
+    gate(
+        "bitemporal_coverage", True,
+        {
+            "withValidFrom": tv2[0][0], "withValidTo": tv2[0][1],
+            "withRecordedAt": tv2[0][2], "withRetiredAt": tv2[0][3],
+            "blocking": False,
+        },
+    )
+
+    gate(
+        "duplicate_classes", not scan["duplicateClasses"],
+        {"duplicates": scan["duplicateClasses"]},
+    )
+    gate(
+        "duplicate_properties", not scan["duplicateProperties"],
+        {"duplicates": scan["duplicateProperties"]},
+    )
+    gate(
+        "conflicts",
+        not scan["duplicateSlugs"] and not scan["singleValueViolations"],
+        {
+            "singleValueViolations": scan["singleValueViolations"],
+            "contested": scan["contested"],
+            "contestedIsFailure": False,
+        },
+    )
+
+    _, sv2 = run_query(
+        graph,
+        "MATCH ()-[r:SIMILAR_TO]->() RETURN count(r) AS total, "
+        "sum(CASE WHEN r.confidence IS NULL AND r.grade IS NULL THEN 1 ELSE 0 END) AS unmarked",
+    )
+    gate(
+        "similar_to_lead_grade", sv2[0][1] == 0,
+        {"edges": sv2[0][0], "withoutLeadGradeMark": sv2[0][1]},
+    )
+
+    passed = all(g["passed"] for g in gates.values())
+    print_json({"graph": graph["slug"], "passed": passed, "gates": gates})
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: write-batch / normalize-scan / categorize / clean-scan / communities
+# ---------------------------------------------------------------------------
+
+def load_batch(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            batch = json.load(handle)
+    except FileNotFoundError:
+        fail(f"batch file not found: {path}", code=2)
+    except json.JSONDecodeError as exc:
+        fail(f"batch file {path} is not valid JSON: {exc}", code=2)
+    if not isinstance(batch, dict):
+        fail(f"batch file {path} must contain a JSON object", code=2)
+    return batch.get("nodes") or [], batch.get("edges") or []
+
+
+def _provenance_of(props):
+    sources = props.get("sources")
+    return (
+        props.get("sourcePath") or props.get("source")
+        or props.get("sourceSlug")
+        or (sources[0] if isinstance(sources, list) and sources else None)
+    )
+
+
+def cmd_write_batch(args):
+    graph = resolve_graph(args[0])
+    nodes_in, edges_in = load_batch(args[1])
+    print_json(apply_batch(graph, nodes_in, edges_in))
+
+
+def apply_batch(graph, nodes_in, edges_in):
+    """The write-batch core, shared with `extract`: validate every item
+    against the live graph + stamped ontology, then apply inside ONE
+    managed transaction — the batch lands in full or not at all."""
+    class_names, obj_props, _ = stamped_terms(graph)
+    refused, superseded, pending_links, pending_prop_links = [], [], [], []
+    applicable = []
+    for item in nodes_in:
+        item = dict(item)
+        props = dict(item.get("props") or {})
+        label = item.get("label")
+        slug = item.get("slug")
+        if (not slug or not isinstance(slug, str)) and props.get("name"):
+            # Identity by construction: no slug supplied — derive it
+            # deterministically from the name so the same entity lands
+            # on the same node from every source.
+            slug = identity_slug(props["name"])
+            item["slug"] = slug
+        desc = {"slug": slug, "label": label}
+        if not slug or not isinstance(slug, str):
+            refused.append({"item": desc, "reason": "node has no slug and no name to derive one from"})
+            continue
+        if props.get("name") and "normalizedName" not in props:
+            props["normalizedName"] = _canonical(props["name"])
+        if "normalizedSlug" not in props:
+            props["normalizedSlug"] = slug
+        item["props"] = props
+        if label not in class_names:
+            refused.append(
+                {
+                    "item": desc,
+                    "reason": f"label '{label}' is not stamped in the graph's ontology",
+                }
+            )
+            continue
+        bad_keys = [k for k in props if not _IDENT_RE.match(k)]
+        if bad_keys:
+            refused.append(
+                {"item": desc, "reason": f"invalid property key(s): {bad_keys}"}
+            )
+            continue
+        if not _provenance_of(props):
+            refused.append(
+                {
+                    "item": desc,
+                    "reason": "missing provenance (props.sourcePath or a source slug is required)",
+                }
+            )
+            continue
+        live = fetch_node_by_slug(graph, slug)
+        supersede_prop = None
+        if live is not None:
+            live_props = live.get("properties", {})
+            live_labels = live.get("labels", [])
+            if label not in live_labels:
+                refused.append(
+                    {
+                        "item": desc,
+                        "reason": f"slug already exists with label(s) {live_labels}, not '{label}'",
+                    }
+                )
+                continue
+            if live_props.get("retiredAt") is None:
+                for prop in SINGLE_VALUE_PROPS:
+                    if (
+                        prop in props
+                        and prop in live_props
+                        and props[prop] != live_props[prop]
+                    ):
+                        newer = (
+                            props.get("recordedAt")
+                            and live_props.get("recordedAt")
+                            and str(props["recordedAt"]) > str(live_props["recordedAt"])
+                        )
+                        if newer:
+                            supersede_prop = prop
+                        else:
+                            refused.append(
+                                {
+                                    "item": desc,
+                                    "reason": (
+                                        f"undecidable conflict on {prop}: live value "
+                                        f"{live_props[prop]!r} vs batch value {props[prop]!r}; "
+                                        "no newer recordedAt evidence — contested candidate, not applied"
+                                    ),
+                                }
+                            )
+                        break
+                if supersede_prop is None and any(
+                    r["item"] == desc for r in refused
+                ):
+                    continue
+        applicable.append((item, live, supersede_prop))
+
+    # Edge validation runs BEFORE anything applies (batch atomicity,
+    # D-05): every edge is checked against the stamped ontology, its
+    # property keys, and its endpoints (live graph ∪ this batch's
+    # applicable nodes). A single refusal anywhere refuses the batch.
+    batch_slugs = {item["slug"] for item, _, _ in applicable}
+    applicable_edges = []
+    for edge in edges_in:
+        frm, to, etype = edge.get("from"), edge.get("to"), edge.get("type")
+        desc = {"from": frm, "to": to, "type": etype}
+        if etype not in obj_props:
+            refused.append(
+                {
+                    "item": desc,
+                    "reason": f"edge type '{etype}' is not a stamped object property in the graph's ontology",
+                }
+            )
+            continue
+        eprops = edge.get("props") or {}
+        bad_keys = [k for k in eprops if not _IDENT_RE.match(k)]
+        if bad_keys:
+            refused.append(
+                {"item": desc, "reason": f"invalid property key(s): {bad_keys}"}
+            )
+            continue
+        if etype not in FACT_EXEMPT_TYPES:
+            fact = eprops.get("fact")
+            if not isinstance(fact, str) or not fact.strip():
+                refused.append(
+                    {
+                        "item": desc,
+                        "reason": (
+                            f"fact edge of type '{etype}' carries no 'fact' "
+                            "sentence — every fact edge must state its "
+                            "one-sentence fact using the endpoint names "
+                            f"(exempt types: {', '.join(sorted(FACT_EXEMPT_TYPES))})"
+                        ),
+                    }
+                )
+                continue
+        missing = None
+        for endpoint in (frm, to):
+            if endpoint not in batch_slugs and fetch_node_by_slug(graph, endpoint) is None:
+                missing = endpoint
+                break
+        if missing:
+            refused.append(
+                {
+                    "item": desc,
+                    "reason": f"endpoint '{missing}' does not exist in the graph or this batch",
+                }
+            )
+            continue
+        applicable_edges.append(edge)
+
+    if refused:
+        # Atomic contract: a batch applies in full or not at all. The
+        # refusals are the result; nothing was written.
+        return {
+            "graph": graph["slug"],
+            "atomic": True,
+            "applied": {"nodes": 0, "edges": 0},
+            "refused": refused,
+            "superseded": [],
+        }
+
+    with managed_tx(graph):
+        applied_nodes = 0
+        _apply_batch_nodes(
+            graph, applicable, superseded, pending_links, pending_prop_links
+        )
+        applied_nodes = len(applicable)
+        for old_slug, new_slug in pending_links:
+            run_query(
+                graph,
+                "MATCH (a {slug: $from}) MATCH (b {slug: $to}) "
+                "MERGE (a)-[:SUPERSEDED_BY]->(b)",
+                parameters={"from": old_slug, "to": new_slug},
+            )
+        for node_slug, doc_slug, prop, old_val, new_val in pending_prop_links:
+            run_query(
+                graph,
+                "MATCH (n {slug: $slug}) MATCH (d:SourceDocument {slug: $doc}) "
+                "MERGE (n)-[r:SUPERSEDED_BY]->(d) "
+                "SET r.factKey = $prop, r.oldValue = $old, r.newValue = $new",
+                parameters={
+                    "slug": node_slug, "doc": doc_slug, "prop": prop,
+                    "old": str(old_val), "new": str(new_val),
+                },
+            )
+        applied_edges = 0
+        for edge in applicable_edges:
+            frm, to, etype = edge.get("from"), edge.get("to"), edge.get("type")
+            eprops = edge.get("props") or {}
+            match = (
+                "MATCH (a {slug: $from}) MATCH (b {slug: $to}) "
+                f"MERGE (a)-[r:{etype}]->(b)"
+            )
+            if eprops:
+                apply_props(graph, match, {"from": frm, "to": to}, eprops, var="r")
+            else:
+                run_query(graph, match, parameters={"from": frm, "to": to})
+            applied_edges += 1
+
+    return {
+        "graph": graph["slug"],
+        "atomic": True,
+        "applied": {"nodes": applied_nodes, "edges": applied_edges},
+        "refused": refused,
+        "superseded": superseded,
+    }
+
+
+def _apply_batch_nodes(graph, applicable, superseded, pending_links, pending_prop_links):
+    """The node-apply half of write-batch. Runs inside the caller's
+    managed transaction; appends to the shared superseded/link lists."""
+    for item, live, supersede_prop in applicable:
+        slug, label = item["slug"], item["label"]
+        props = dict(item.get("props") or {})
+        target_slug = props.pop("supersedes", None)
+        if supersede_prop and live is not None:
+            live_props = live.get("properties", {})
+            old_val = live_props.get(supersede_prop)
+            entry = (
+                f"value={old_val}|source="
+                f"{live_props.get('sourcePath') or live_props.get('source') or ''}"
+                f"|retiredAt={props.get('recordedAt')}"
+            )
+            history = list(live_props.get("supersededValues") or [])
+            history.append(entry)
+            props["supersededValues"] = history
+            superseded.append(
+                {"slug": slug, "property": supersede_prop, "oldValue": old_val,
+                 "newValue": props.get(supersede_prop)}
+            )
+            # Parity with cmd_supersede: a property supersession also gets
+            # its SUPERSEDED_BY link to the correcting SourceDocument when
+            # the batch provenance resolves to one in the graph.
+            doc = _resolve_source_doc(graph, props)
+            if doc is not None:
+                doc_slug = doc.get("properties", {}).get("slug")
+                if doc_slug:
+                    pending_prop_links.append(
+                        (slug, doc_slug, supersede_prop, old_val,
+                         props.get(supersede_prop))
+                    )
+                    superseded[-1]["supersededByLinkTo"] = doc_slug
+        if target_slug and target_slug != slug:
+            target = fetch_node_by_slug(graph, target_slug)
+            if target is not None and target.get("properties", {}).get("retiredAt") is None:
+                stamp = props.get("recordedAt") or now_utc()
+                tprops = target.get("properties", {})
+                setmap = {"retiredAt": stamp}
+                if tprops.get("validFrom") and not tprops.get("validTo"):
+                    setmap["validTo"] = stamp
+                apply_props(
+                    graph, "MATCH (n {slug: $slug})", {"slug": target_slug}, setmap
+                )
+                pending_links.append((target_slug, slug))
+                superseded.append({"from": target_slug, "to": slug})
+        keys = sorted(props)
+        if keys:
+            assignments = ", ".join(f"n.{k} = $v_{k}" for k in keys)
+            params = {"slug": slug}
+            for k in keys:
+                params[f"v_{k}"] = props[k]
+            run_query(
+                graph,
+                f"MERGE (n:{label} {{slug: $slug}}) SET {assignments}",
+                parameters=params,
+            )
+        else:
+            run_query(
+                graph, f"MERGE (n:{label} {{slug: $slug}})", parameters={"slug": slug}
+            )
+
+
+def _canonical(text):
+    step = re.sub(r"[^\w\s]", " ", str(text).lower())
+    return re.sub(r"\s+", " ", step).strip()
+
+
+def _canonical_slug(slug):
+    return _canonical(str(slug).replace("-", " ").replace("_", " "))
+
+
+def _as_list(val):
+    if val is None:
+        return []
+    return val if isinstance(val, list) else [val]
+
+
+def cmd_normalize_scan(args):
+    graph = resolve_graph(args[0])
+    _, values = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " RETURN n",
+    )
+    nodes = []
+    for row in values:
+        props = row[0].get("properties", {})
+        if props.get("slug"):
+            nodes.append(props)
+    nodes.sort(key=lambda p: p["slug"])
+    candidates = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            a, b = nodes[i], nodes[j]
+            pair = {"a": a["slug"], "b": b["slug"]}
+            ca, cb = _canonical(a.get("name") or ""), _canonical(b.get("name") or "")
+            if ca and ca == cb:
+                candidates.append(
+                    {**pair, "rule": "name-equal-after-canonicalization",
+                     "evidence": ca}
+                )
+            sa, sb = _canonical_slug(a["slug"]), _canonical_slug(b["slug"])
+            if sa and sa == sb and a["slug"] != b["slug"]:
+                candidates.append(
+                    {**pair, "rule": "slug-collision-after-canonicalization",
+                     "evidence": sa}
+                )
+            aliases_a = {str(x).strip().lower() for x in _as_list(a.get("alias")) if str(x).strip()}
+            aliases_b = {str(x).strip().lower() for x in _as_list(b.get("alias")) if str(x).strip()}
+            for shared in sorted(aliases_a & aliases_b):
+                candidates.append(
+                    {**pair, "rule": "shared-alias", "evidence": shared}
+                )
+            for key in ("legalName", "sourcePath", "email"):
+                va, vb = a.get(key), b.get(key)
+                if va and vb and str(va).strip().lower() == str(vb).strip().lower():
+                    candidates.append(
+                        {**pair, "rule": "shared-identity-key",
+                         "evidence": f"{key}: {va}"}
+                    )
+    candidates.sort(key=lambda c: (c["a"], c["b"], c["rule"], c["evidence"]))
+    print_json({"graph": graph["slug"], "candidates": candidates})
+
+
+def _category_for(labels, props):
+    # Specific classes first: a node carrying both Company and Group
+    # (the two LLCs) is a company, not a group.
+    for label in (
+        "Person", "Company", "Project", "Place", "Event",
+        "Commitment", "Bid", "Account",
+    ):
+        if label in labels:
+            return label.lower()
+    if "Group" in labels:
+        return "group"
+    if "Question" in labels:
+        # Stored chat/pipeline questions carry category "question" by
+        # the answering-loop storage contract. (Swarm integration fix,
+        # 2026-11-17: the value was in use on probe graphs while the
+        # closed set rejected it, failing verify's category_values.)
+        return "question"
+    if "SourceDocument" in labels:
+        sp = props.get("sourcePath") or ""
+        base = sp.rsplit("/", 1)[-1]
+        # INDEX first: an index file under memory/people/ or
+        # memory/groups/ is an index, not a people/groups page —
+        # the path checks below would otherwise shadow it.
+        if "INDEX" in base.upper():
+            return "index"
+        if "/people/" in sp or sp.startswith("memory/people/"):
+            return "people-page"
+        if "/groups/" in sp or sp.startswith("memory/groups/"):
+            return "groups-page"
+        if "/profile/" in sp:
+            return "profile"
+        if base in STANDING_FILES:
+            return "standing-file"
+        # Fallback: a SourceDocument matching no specific rule is a
+        # generic document (probe notes, uploads, one-off sources) —
+        # never residue. (missing_category fix, 2026-11-17.)
+        return "document"
+    return None
+
+
+def cmd_categorize(args):
+    graph = resolve_graph(args[0])
+    _, values = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " RETURN n",
+    )
+    categorized, updated, residue = 0, 0, []
+    for row in values:
+        node = row[0]
+        props = node.get("properties", {})
+        slug = props.get("slug")
+        category = _category_for(node.get("labels", []), props)
+        if category is None:
+            if slug:
+                residue.append(slug)
+            continue
+        categorized += 1
+        if props.get("category") != category and slug:
+            run_query(
+                graph,
+                "MATCH (n {slug: $slug}) SET n.category = $category",
+                parameters={"slug": slug, "category": category},
+            )
+            updated += 1
+    residue.sort()
+    print_json(
+        {
+            "graph": graph["slug"],
+            "categorized": categorized,
+            "updated": updated,
+            "residue": residue,
+        }
+    )
+
+
+def cmd_clean_scan(args):
+    graph = resolve_graph(args[0])
+    _, obj_props, _ = stamped_terms(graph)
+    declared = obj_props | CONVENTION_TYPES
+    _, values = run_query(
+        graph,
+        "MATCH (a)-[r]->(b) RETURN elementId(a) AS fa, a.slug AS fs, "
+        "type(r) AS t, elementId(b) AS tb, b.slug AS ts",
+    )
+    groups = {}
+    self_edges = []
+    type_counts = {}
+    for fa, fs, t, tb, ts in values:
+        type_counts[t] = type_counts.get(t, 0) + 1
+        key = (fa, t, tb)
+        entry = groups.setdefault(
+            key, {"from": fs or fa, "to": ts or tb, "type": t, "count": 0}
+        )
+        entry["count"] += 1
+        if fa == tb:
+            self_edges.append({"from": fs or fa, "to": ts or tb, "type": t})
+    duplicate_edges = sorted(
+        (e for e in groups.values() if e["count"] > 1),
+        key=lambda e: (e["from"], e["to"], e["type"]),
+    )
+    self_edges.sort(key=lambda e: (e["from"], e["to"], e["type"]))
+    _, iv = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "AND NOT (n)--() RETURN n.slug AS slug ORDER BY slug",
+    )
+    isolated = [row[0] for row in iv if row[0]]
+    undeclared = [
+        {"type": t, "count": c}
+        for t, c in sorted(type_counts.items())
+        if t not in declared
+    ]
+    print_json(
+        {
+            "graph": graph["slug"],
+            "duplicateEdges": duplicate_edges,
+            "selfEdges": self_edges,
+            "isolatedContent": isolated,
+            "undeclaredTypes": undeclared,
+        }
+    )
+
+
+VOCAB_STOPWORDS = frozenset(
+    "a an and are as at be by for from has have in into is it its of on or "
+    "that the their this to was were will with".split()
+)
+
+
+def cmd_vocab(args):
+    """Vocabulary discovery (skill §2, the Utopia pattern): count the
+    terms the corpus actually uses — content-node names, summaries and
+    categories, plus edge fact sentences — ranked by frequency with
+    their sources, and mark which candidate terms the graph's stamped
+    ontology does NOT cover. A rising out-of-ontology term is the
+    signal the schema is missing something real: it stays visible as
+    a count, never silently absorbed as a label and never silently
+    dropped. Read-only."""
+    graph = resolve_graph(args[0])
+    class_names, obj_props, data_props = stamped_terms(graph)
+    covered = set()
+    for term in class_names | obj_props | data_props:
+        covered.add(_canonical(term))
+        # CamelCase / snake_case pieces count as covered too:
+        # SourceDocument covers 'source' and 'document'.
+        for piece in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+",
+                                term.replace("_", " ")):
+            covered.add(piece.lower())
+    counts = {}
+    sources = {}
+
+    def feed(text, source):
+        if not text:
+            return
+        for token in re.findall(r"[a-z0-9]+", _canonical(text)):
+            if len(token) < 3 or token in VOCAB_STOPWORDS or token.isdigit():
+                continue
+            counts[token] = counts.get(token, 0) + 1
+            sources.setdefault(token, set()).add(source)
+
+    _, nvals = run_query(
+        graph, "MATCH (n) WHERE " + _content_scope() + " RETURN n"
+    )
+    nodes_scanned = 0
+    for row in nvals:
+        props = row[0].get("properties", {})
+        nodes_scanned += 1
+        src = props.get("slug") or "node"
+        feed(props.get("name"), src)
+        summary = props.get("summary")
+        if isinstance(summary, list):
+            summary = " ".join(str(s) for s in summary)
+        feed(summary, src)
+        feed(props.get("category"), src)
+    _, fvals = run_query(
+        graph,
+        "MATCH (a)-[r]->(b) WHERE r.fact IS NOT NULL "
+        "RETURN a.slug, type(r), b.slug, r.fact",
+    )
+    facts_scanned = 0
+    for frm, etype, to, fact in fvals:
+        facts_scanned += 1
+        feed(fact, f"{frm}-[{etype}]->{to}")
+    terms = [
+        {
+            "term": term,
+            "count": counts[term],
+            "sources": sorted(sources[term])[:5],
+            "sourceCount": len(sources[term]),
+            "coveredByOntology": term in covered,
+        }
+        for term in counts
+    ]
+    terms.sort(key=lambda t: (-t["count"], t["term"]))
+    print_json(
+        {
+            "graph": graph["slug"],
+            "nodesScanned": nodes_scanned,
+            "factEdgesScanned": facts_scanned,
+            "distinctTerms": len(terms),
+            "uncoveredTerms": sum(
+                1 for t in terms if not t["coveredByOntology"]
+            ),
+            "terms": terms,
+        }
+    )
+
+
+def cmd_communities(args):
+    graph = resolve_graph(args[0])
+    _, values = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "RETURN n.slug AS slug ORDER BY slug",
+    )
+    slugs = [row[0] for row in values if row[0]]
+    slug_set = set(slugs)
+    _, ev = run_query(
+        graph,
+        "MATCH (a)-[r]->(b) WHERE " + _content_scope("a") + " "
+        "AND " + _content_scope("b") + " "
+        "RETURN a.slug AS fa, b.slug AS fb",
+    )
+    adjacency = {s: set() for s in slugs}
+    for fa, fb in ev:
+        if fa in slug_set and fb in slug_set and fa != fb:
+            adjacency[fa].add(fb)
+            adjacency[fb].add(fa)
+    labels = {s: s for s in slugs}
+    for _ in range(20):
+        changed = False
+        for slug in slugs:
+            neighbors = adjacency[slug]
+            if not neighbors:
+                continue
+            counts = {}
+            for nb in neighbors:
+                counts[labels[nb]] = counts.get(labels[nb], 0) + 1
+            best = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            if best != labels[slug]:
+                labels[slug] = best
+                changed = True
+        if not changed:
+            break
+    groups = {}
+    for slug in slugs:
+        groups.setdefault(labels[slug], []).append(slug)
+    ordered = sorted(groups.values(), key=lambda members: (-len(members), members[0]))
+    assignment = {}
+    communities = []
+    for idx, members in enumerate(ordered, start=1):
+        cid = f"community-{idx}"
+        communities.append({"id": cid, "size": len(members)})
+        for member in members:
+            assignment[member] = cid
+    for slug in slugs:
+        run_query(
+            graph,
+            "MATCH (n {slug: $slug}) SET n.community = $community",
+            parameters={"slug": slug, "community": assignment[slug]},
+        )
+    print_json(
+        {"graph": graph["slug"], "communities": communities, "assigned": len(slugs)}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: supersede / similar / rename
+# ---------------------------------------------------------------------------
+
+def _refuse_json(graph, reason):
+    print_json({"graph": graph["slug"], "refused": reason})
+    sys.exit(1)
+
+
+def _resolve_source_doc(graph, props):
+    """Find the correcting SourceDocument named by a batch item's provenance."""
+    for key in ("source", "sourceSlug"):
+        slug = props.get(key)
+        if slug:
+            node = fetch_node_by_slug(graph, slug)
+            if node is not None and "SourceDocument" in node.get("labels", []):
+                return node
+    source_path = props.get("sourcePath")
+    if source_path:
+        _, values = run_query(
+            graph,
+            "MATCH (d:SourceDocument {sourcePath: $sp}) RETURN d",
+            parameters={"sp": source_path},
+        )
+        if values:
+            return values[0][0]
+    return None
+
+
+def cmd_supersede(args):
+    graph = resolve_graph(args[0])
+    try:
+        fact_ref = json.loads(args[1])
+    except json.JSONDecodeError:
+        fail("fact-ref must be a JSON object: {slug, property} or {from, to, type}", code=2)
+    nodes_in, edges_in = load_batch(args[2])
+    class_names, obj_props, _ = stamped_terms(graph)
+    scan = build_scan(graph)
+    stamp = now_utc()
+
+    if "slug" in fact_ref and "property" in fact_ref:
+        slug, prop = fact_ref["slug"], fact_ref["property"]
+        if not _IDENT_RE.match(prop):
+            _refuse_json(graph, f"invalid property name '{prop}'")
+        if len(nodes_in) != 1 or edges_in:
+            _refuse_json(graph, "batch must carry exactly one corrected node fact")
+        item = nodes_in[0]
+        props = dict(item.get("props") or {})
+        if item.get("slug") != slug:
+            _refuse_json(graph, "batch node slug does not match fact-ref slug")
+        if item.get("label") not in class_names:
+            _refuse_json(
+                graph,
+                f"label '{item.get('label')}' is not stamped in the graph's ontology",
+            )
+        if not _provenance_of(props):
+            _refuse_json(graph, "no provenance — not a verifiable supersession")
+        if prop not in props:
+            _refuse_json(graph, f"batch does not carry a corrected value for '{prop}'")
+        live = fetch_node_by_slug(graph, slug)
+        if live is None:
+            _refuse_json(graph, f"no live node with slug '{slug}'")
+        live_props = live.get("properties", {})
+        if live_props.get("retiredAt") is not None:
+            _refuse_json(graph, f"node '{slug}' is already retired")
+        if prop not in live_props:
+            _refuse_json(graph, f"live node '{slug}' carries no '{prop}' fact to retire")
+        for viol in scan["singleValueViolations"]:
+            if viol["property"] == prop and viol["node"] != slug:
+                _refuse_json(
+                    graph,
+                    f"scan says undecidable: {prop} already has multiple live values on '{viol['node']}'",
+                )
+        doc = _resolve_source_doc(graph, props)
+        if doc is None:
+            _refuse_json(
+                graph,
+                "correcting SourceDocument named by the batch provenance is not in the graph — cannot link SUPERSEDED_BY",
+            )
+        doc_slug = doc.get("properties", {}).get("slug")
+        old_val = live_props[prop]
+        entry = (
+            f"value={old_val}|source="
+            f"{live_props.get('sourcePath') or live_props.get('source') or ''}"
+            f"|retiredAt={stamp}"
+        )
+        history = list(live_props.get("supersededValues") or [])
+        history.append(entry)
+        props["supersededValues"] = history
+        props["recordedAt"] = stamp
+        props.pop("supersedes", None)
+        keys = sorted(props)
+        assignments = ", ".join(f"n.{k} = $v_{k}" for k in keys)
+        params = {"slug": slug}
+        for k in keys:
+            params[f"v_{k}"] = props[k]
+        with managed_tx(graph):
+            run_query(
+                graph, f"MATCH (n {{slug: $slug}}) SET {assignments}", parameters=params
+            )
+            run_query(
+                graph,
+                "MATCH (n {slug: $slug}) MATCH (d:SourceDocument {slug: $doc}) "
+                "MERGE (n)-[r:SUPERSEDED_BY]->(d) "
+                "SET r.factKey = $prop, r.oldValue = $old, r.newValue = $new",
+                parameters={
+                    "slug": slug, "doc": doc_slug, "prop": prop,
+                    "old": str(old_val), "new": str(props[prop]),
+                },
+            )
+            decision = logged_decision(
+                graph, f"supersede of property '{prop}' on node '{slug}'",
+                "supersede", slug,
+                {"property": prop, "oldValue": str(old_val), "newValue": str(props[prop])},
+                link_slug=slug,
+            )
+        rescan = build_scan(graph)
+        remaining = [
+            v for v in rescan["singleValueViolations"] if v["node"] == slug
+        ] + [c for c in rescan["contested"] if c["a"] == slug]
+        print_json(
+            {
+                "graph": graph["slug"],
+                "decision": decision,
+                "retired": {
+                    "slug": slug, "property": prop, "oldValue": old_val,
+                    "retiredAt": stamp, "supersededValuesEntry": entry,
+                },
+                "applied": {
+                    "slug": slug, "property": prop, "newValue": props[prop],
+                    "recordedAt": stamp, "supersededByLinkTo": doc_slug,
+                },
+                "rescan": "clean" if not remaining else remaining,
+            }
+        )
+        return
+
+    if {"from", "to", "type"} <= set(fact_ref):
+        frm, to, etype = fact_ref["from"], fact_ref["to"], fact_ref["type"]
+        if len(edges_in) != 1 or nodes_in:
+            _refuse_json(graph, "batch must carry exactly one corrected edge fact")
+        edge = edges_in[0]
+        eprops = dict(edge.get("props") or {})
+        if edge.get("from") != frm or edge.get("to") != to:
+            _refuse_json(graph, "batch edge endpoints do not match fact-ref")
+        if edge.get("type") not in obj_props:
+            _refuse_json(
+                graph,
+                f"edge type '{edge.get('type')}' is not a stamped object property in the graph's ontology",
+            )
+        if not _provenance_of(eprops):
+            _refuse_json(graph, "no provenance — not a verifiable supersession")
+        _, ev = run_query(
+            graph,
+            f"MATCH (a {{slug: $from}})-[r:{etype}]->(b {{slug: $to}}) "
+            "WHERE r.retiredAt IS NULL RETURN r",
+            parameters={"from": frm, "to": to},
+        )
+        if not ev:
+            _refuse_json(graph, f"no live edge {frm}-[{etype}]->{to} to retire")
+        old_props = ev[0][0].get("properties", {})
+        retire = {"retiredAt": stamp}
+        if old_props.get("validFrom") and not old_props.get("validTo"):
+            retire["validTo"] = stamp
+        with managed_tx(graph):
+            apply_props(
+                graph,
+                f"MATCH (a {{slug: $from}})-[r:{etype}]->(b {{slug: $to}})",
+                {"from": frm, "to": to}, retire, var="r",
+            )
+            eprops["recordedAt"] = stamp
+            eprops["supersedesFact"] = f"{frm}-[{etype}]->{to}"
+            match = (
+                "MATCH (a {slug: $from}) MATCH (b {slug: $to}) "
+                f"MERGE (a)-[r:{edge['type']}]->(b)"
+            )
+            apply_props(graph, match, {"from": frm, "to": to}, eprops, var="r")
+            logged_decision(
+                graph, f"supersede of edge {frm}-[{etype}]->{to}",
+                "supersede", f"{frm}-[{etype}]->{to}",
+                {"correctedType": edge["type"], "retiredAt": stamp},
+                link_slug=frm,
+            )
+        rescan = build_scan(graph)
+        remaining = [
+            v for v in rescan["singleValueViolations"] if v["node"] in (frm, to)
+        ]
+        print_json(
+            {
+                "graph": graph["slug"],
+                "retired": {
+                    "from": frm, "to": to, "type": etype, "retiredAt": stamp,
+                    "note": "edge facts cannot be endpoints of a SUPERSEDED_BY edge in a property graph; the link is recorded on the corrected edge as supersedesFact",
+                },
+                "applied": {
+                    "from": edge["from"], "to": edge["to"], "type": edge["type"],
+                    "recordedAt": stamp, "supersedesFact": eprops["supersedesFact"],
+                },
+                "rescan": "clean" if not remaining else remaining,
+            }
+        )
+        return
+
+    fail("fact-ref must be {slug, property} or {from, to, type}", code=2)
+
+
+def _parse_threshold(raw):
+    try:
+        threshold = float(raw)
+    except ValueError:
+        fail(f"threshold '{raw}' is not a number", code=2)
+    if not 0.0 <= threshold <= 1.0:
+        fail("threshold must be between 0 and 1", code=2)
+    return threshold
+
+
+def _similar_pairs(graph, threshold):
+    """Content-node pairs at raw cosine >= threshold. Pure read."""
+    _, values = run_query(
+        graph,
+        "MATCH (n) WHERE " + _content_scope() + " "
+        "AND n.embedding IS NOT NULL RETURN n.slug AS slug, n.embedding AS vec",
+    )
+    vectors = {row[0]: row[1] for row in values if row[0]}
+    slugs = sorted(vectors)
+    pairs = []
+    for i in range(len(slugs)):
+        for j in range(i + 1, len(slugs)):
+            a, b = slugs[i], slugs[j]
+            va, vb = vectors[a], vectors[b]
+            dot = sum(x * y for x, y in zip(va, vb))
+            na = math.sqrt(sum(x * x for x in va))
+            nb = math.sqrt(sum(y * y for y in vb))
+            if na == 0 or nb == 0:
+                continue
+            cosine = dot / (na * nb)
+            if cosine >= threshold:
+                pairs.append({"a": a, "b": b, "cosine": round(cosine, 6)})
+    pairs.sort(key=lambda p: (-p["cosine"], p["a"], p["b"]))
+    return pairs
+
+
+def cmd_similar(args):
+    graph = resolve_graph(args[0])
+    threshold = _parse_threshold(args[1])
+    pairs = _similar_pairs(graph, threshold)
+    stamp = now_utc()
+    for pair in pairs:
+        run_query(
+            graph,
+            "MATCH (a {slug: $a}) MATCH (b {slug: $b}) "
+            "MERGE (a)-[r:SIMILAR_TO]->(b) SET r.grade = 'lead', r.confidence = 'lead', "
+            "r.basis = 'embeddinggemma-2-text', r.cosine = $cos, r.recordedAt = $at",
+            parameters={
+                "a": pair["a"], "b": pair["b"], "cos": pair["cosine"], "at": stamp,
+            },
+        )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "threshold": threshold,
+            "pairs": pairs,
+            "written": len(pairs),
+        }
+    )
+
+
+def cmd_similar_scan(args):
+    """Read-only twin of similar: the same pairs, nothing written.
+
+    Exists so read-only consumers (the dream candidates stage) never have
+    to pull every embedding into an agent's context and hand-compute
+    cosines — the deterministic tool does the math."""
+    graph = resolve_graph(args[0])
+    threshold = _parse_threshold(args[1])
+    pairs = _similar_pairs(graph, threshold)
+    print_json(
+        {
+            "graph": graph["slug"],
+            "threshold": threshold,
+            "pairs": pairs,
+            "written": 0,
+        }
+    )
+
+
+def cmd_rename(args):
+    graph = resolve_graph(args[0])
+    kind, old, new = args[1], args[2], args[3]
+    if kind not in ("class", "property"):
+        fail("kind must be 'class' or 'property'", code=2)
+    if not _IDENT_RE.match(new):
+        fail(f"new name '{new}' is not a valid identifier", code=2)
+    label = "OntologyClass" if kind == "class" else "OntologyProperty"
+    _, tv = run_query(
+        graph,
+        f"MATCH (t:{label} {{name: $name}}) RETURN count(t) AS c",
+        parameters={"name": old},
+    )
+    if tv[0][0] == 0:
+        fail(f"no {kind} term named '{old}' in graph '{graph['slug']}'", code=3)
+    _, nv = run_query(
+        graph,
+        f"MATCH (t:{label} {{name: $name}}) RETURN count(t) AS c",
+        parameters={"name": new},
+    )
+    if nv[0][0] > 0:
+        _refuse_json(
+            graph, f"a {kind} term named '{new}' already exists — rename would duplicate it"
+        )
+    references = 0
+    if kind == "class":
+        if not _IDENT_RE.match(old):
+            _refuse_json(graph, f"existing class name '{old}' is not a plain identifier; refusing label surgery")
+        _, rv = run_query(graph, f"MATCH (n:{old}) RETURN count(n) AS c")
+        references = rv[0][0]
+        if references:
+            run_query(graph, f"MATCH (n:{old}) REMOVE n:{old} SET n:{new}")
+        apply_props(
+            graph, f"MATCH (t:{label} {{name: $name}})", {"name": old},
+            {"name": new, "graphLabel": new}, var="t",
+        )
+    else:
+        term = None
+        for node in fetch_nodes(graph, label):
+            if node.get("properties", {}).get("name") == old:
+                term = node.get("properties", {})
+                break
+        term_kind = (term or {}).get("kind")
+        if term_kind == "object":
+            if not _IDENT_RE.match(old):
+                _refuse_json(graph, f"existing type name '{old}' is not a plain identifier; refusing edge surgery")
+            _, rv = run_query(
+                graph, f"MATCH ()-[r:{old}]->() RETURN count(r) AS c"
+            )
+            references = rv[0][0]
+            if references:
+                _, pv = run_query(
+                    graph,
+                    f"MATCH (a)-[r:{old}]->(b) RETURN count(r) AS c, "
+                    "sum(CASE WHEN size(keys(r)) > 0 THEN 1 ELSE 0 END) AS withProps",
+                )
+                if pv[0][1]:
+                    _refuse_json(
+                        graph,
+                        f"edges of type '{old}' carry properties and this tool cannot copy them across a type rename — documented gap, nothing changed",
+                    )
+                run_query(
+                    graph,
+                    f"MATCH (a)-[r:{old}]->(b) CREATE (a)-[:{new}]->(b) DELETE r",
+                )
+            apply_props(
+                graph, f"MATCH (t:{label} {{name: $name}})", {"name": old},
+                {"name": new, "graphType": new}, var="t",
+            )
+        else:
+            if not _IDENT_RE.match(old):
+                _refuse_json(graph, f"existing property key '{old}' is not a plain identifier; refusing key surgery")
+            _, rv = run_query(
+                graph, f"MATCH (n) WHERE n.{old} IS NOT NULL RETURN count(n) AS c"
+            )
+            references = rv[0][0]
+            if references:
+                run_query(
+                    graph,
+                    f"MATCH (n) WHERE n.{old} IS NOT NULL "
+                    f"SET n.{new} = n.{old} REMOVE n.{old}",
+                )
+            apply_props(
+                graph, f"MATCH (t:{label} {{name: $name}})", {"name": old},
+                {"name": new, "graphKey": new}, var="t",
+            )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "kind": kind,
+            "from": old,
+            "to": new,
+            "referencesUpdated": references,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: merge log + reversible merges / decision ledger / review items /
+# edge fact embeddings (Utopia + Graphiti steals, as typed tools)
+# ---------------------------------------------------------------------------
+
+def _capture_edges(graph, slug):
+    """Every edge touching a node, as restorable {from, to, type, props} records."""
+    records = []
+    _, out_values = run_query(
+        graph,
+        "MATCH (n {slug: $slug})-[r]->(m) RETURN type(r) AS t, m.slug AS other, r",
+        parameters={"slug": slug},
+    )
+    for etype, other, rel in out_values:
+        records.append(
+            {"from": slug, "to": other, "type": etype,
+             "props": rel.get("properties", {})}
+        )
+    _, in_values = run_query(
+        graph,
+        "MATCH (n {slug: $slug})<-[r]-(m) RETURN type(r) AS t, m.slug AS other, r",
+        parameters={"slug": slug},
+    )
+    for etype, other, rel in in_values:
+        if other == slug:
+            continue  # self-edges already captured by the outgoing pass
+        records.append(
+            {"from": other, "to": slug, "type": etype,
+             "props": rel.get("properties", {})}
+        )
+    return records
+
+
+def _edge_exists(graph, frm, etype, to):
+    _, values = run_query(
+        graph,
+        f"MATCH (a {{slug: $from}})-[r:{etype}]->(b {{slug: $to}}) "
+        "RETURN count(r) AS c",
+        parameters={"from": frm, "to": to},
+    )
+    return values[0][0] > 0
+
+
+def _create_edge(graph, frm, etype, to, props):
+    match = (
+        "MATCH (a {slug: $from}) MATCH (b {slug: $to}) "
+        f"CREATE (a)-[r:{etype}]->(b)"
+    )
+    if props:
+        apply_props(graph, match, {"from": frm, "to": to}, props, var="r")
+    else:
+        run_query(graph, match, parameters={"from": frm, "to": to})
+
+
+def cmd_merge(args):
+    graph = resolve_graph(args[0])
+    winner_slug, loser_slug = args[1], args[2]
+    try:
+        basis = json.loads(args[3])
+    except json.JSONDecodeError:
+        fail("basis must be valid JSON", code=2)
+    if winner_slug == loser_slug:
+        fail("winner and loser must be different nodes", code=2)
+    winner = fetch_node_by_slug(graph, winner_slug)
+    if winner is None:
+        fail(f"no node with slug '{winner_slug}' in graph '{graph['slug']}'", code=3)
+    loser = fetch_node_by_slug(graph, loser_slug)
+    if loser is None:
+        fail(f"no node with slug '{loser_slug}' in graph '{graph['slug']}'", code=3)
+    bookkeeping = {"Ontology", "OntologyClass", "OntologyProperty",
+                   "Decision", "ReviewItem", "SpaceSignal"}
+    for role, node, node_slug in (
+        ("winner", winner, winner_slug), ("loser", loser, loser_slug)
+    ):
+        hit = sorted(set(node.get("labels") or []) & bookkeeping)
+        if hit:
+            _refuse_json(
+                graph,
+                f"{role} '{node_slug}' is a bookkeeping node "
+                f"({', '.join(hit)}) — merge is an identity operation on "
+                "content nodes only; nothing changed",
+            )
+    winner_label = (winner.get("labels") or ["Node"])[0]
+    loser_first_label = (loser.get("labels") or ["Node"])[0]
+    if winner_label != loser_first_label:
+        _refuse_json(
+            graph,
+            f"winner is a {winner_label} and loser is a {loser_first_label} — "
+            "merge unifies two records of the same kind of thing; a "
+            "cross-label merge would corrupt both identities; nothing changed",
+        )
+    loser_props = dict(loser.get("properties", {}))
+    loser_label = (loser.get("labels") or ["Node"])[0]
+    edges = _capture_edges(graph, loser_slug)
+    for record in edges:
+        if record["from"] is None or record["to"] is None:
+            _refuse_json(
+                graph,
+                "loser has an edge to a node with no slug — cannot re-point deterministically; merge refused, nothing changed",
+            )
+    stamp = now_utc()
+    winner_props = dict(winner.get("properties", {}))
+    copied, preserved = [], []
+    updates = {}
+    history = list(winner_props.get("supersededValues") or [])
+    for key, val in loser_props.items():
+        if key in ("slug", "embedding", "embedding_dim", "embedding_model", "alias",
+                   "supersededValues"):
+            continue
+        if key not in winner_props or winner_props.get(key) is None:
+            updates[key] = val
+            copied.append(key)
+        elif winner_props[key] != val:
+            history.append(
+                f"value={val}|source=merge:{loser_slug}|retiredAt={stamp}"
+            )
+            preserved.append(key)
+    if preserved:
+        updates["supersededValues"] = history
+    aliases = [str(a) for a in _as_list(winner_props.get("alias"))]
+    if loser_slug not in aliases:
+        aliases.append(loser_slug)
+    updates["alias"] = aliases
+    winner_alias_form = (
+        "list" if isinstance(winner_props.get("alias"), list)
+        else ("string" if winner_props.get("alias") is not None else "absent")
+    )
+    with managed_tx(graph):
+        apply_props(
+            graph, "MATCH (n {slug: $slug})", {"slug": winner_slug}, updates
+        )
+        repointed, merged_existing = 0, 0
+        state_edges = []
+        for record in edges:
+            new_from = winner_slug if record["from"] == loser_slug else record["from"]
+            new_to = winner_slug if record["to"] == loser_slug else record["to"]
+            into_existing = _edge_exists(graph, new_from, record["type"], new_to)
+            state_edges.append({**record, "mergedIntoExisting": into_existing})
+            if into_existing:
+                merged_existing += 1
+            else:
+                _create_edge(graph, new_from, record["type"], new_to, record["props"])
+                repointed += 1
+        _, dv = run_query(
+            graph,
+            "MATCH (n {slug: $slug}) DETACH DELETE n RETURN count(*) AS c",
+            parameters={"slug": loser_slug},
+        )
+        if not dv or dv[0][0] != 1:
+            fail(f"loser node '{loser_slug}' was not deleted as expected")
+        loser_state = {"label": loser_label, "props": loser_props, "edges": state_edges}
+        decision = logged_decision(
+            graph,
+            f"merge of '{loser_slug}' into '{winner_slug}' (the pre-merge state "
+            "was NOT recorded, so this merge cannot be unmerged)",
+            "merge", f"{loser_slug} -> {winner_slug}",
+            {"winner": winner_slug, "loser": loser_slug, "basis": basis},
+            extra={
+                "winner": winner_slug,
+                "loser": loser_slug,
+                "basis": json.dumps(basis, default=str),
+                "reversible": True,
+                "winnerAliasForm": winner_alias_form,
+                "loserState": json.dumps(loser_state, default=str),
+            },
+            link_slug=winner_slug,
+        )
+    # D-15: the winner absorbed the loser's properties, so the vector
+    # it carried in no longer describes the merged node (and
+    # embed-missing only fills NULL embeddings, so a stale vector
+    # would never refresh on its own). Re-embed the winner from its
+    # post-merge properties with the same machinery embed-missing
+    # uses (document format eg2-doc-v1, resolved model stamp).
+    reembed = {"reembedded": False}
+    if winner_label in CONTENT_LABELS or winner_props.get("embedding") is not None:
+        try:
+            ensure_ollama()
+            model_stamp = resolved_model_stamp()
+            fresh = fetch_node_by_slug(graph, winner_slug)
+            fresh_props = (fresh or {}).get("properties", {})
+            vec = embed_text(
+                compose_embed_text(fresh_props)
+                or f"title: none | text: {winner_slug}"
+            )
+            if len(vec) != EMBED_DIM:
+                raise ValueError(
+                    f"embedding has {len(vec)} dims, expected {EMBED_DIM}"
+                )
+            run_query(
+                graph,
+                "MATCH (n {slug: $slug}) SET n.embedding = $vec, "
+                "n.embedding_dim = $dim, n.embedding_model = $model, "
+                "n.embedding_format = $format",
+                parameters={
+                    "slug": winner_slug, "vec": vec, "dim": EMBED_DIM,
+                    "model": model_stamp, "format": EMBED_FORMAT,
+                },
+            )
+            reembed = {
+                "reembedded": True,
+                "model": model_stamp,
+                "format": EMBED_FORMAT,
+                "dim": EMBED_DIM,
+            }
+        except Exception as exc:  # the merge landed; the stale vector is data
+            reembed = {"reembedded": False, "error": str(exc)}
+    else:
+        reembed = {
+            "reembedded": False,
+            "skipped": "winner is not an embedded content node",
+        }
+    print_json(
+        {
+            "graph": graph["slug"],
+            "decision": decision,
+            "winner": winner_slug,
+            "loser": loser_slug,
+            "propsCopied": copied,
+            "propsPreservedInSupersededValues": preserved,
+            "edgesRepointed": repointed,
+            "edgesMergedIntoExisting": merged_existing,
+            "embeddingReembedded": reembed["reembedded"],
+            "reembed": reembed,
+        }
+    )
+
+
+def cmd_unmerge(args):
+    graph = resolve_graph(args[0])
+    decision_id = args[1]
+    node = fetch_node_by_slug(graph, decision_id)
+    if node is None or "Decision" not in node.get("labels", []):
+        fail(f"no decision with id '{decision_id}' in graph '{graph['slug']}'", code=3)
+    dprops = node.get("properties", {})
+    if dprops.get("kind") != "merge":
+        _refuse_json(graph, f"decision '{decision_id}' is kind '{dprops.get('kind')}', not a merge")
+    if dprops.get("revertedAt"):
+        _refuse_json(graph, f"decision '{decision_id}' was already reverted at {dprops['revertedAt']}")
+    state = json.loads(dprops["loserState"])
+    loser_slug = dprops["loser"]
+    winner_slug = dprops["winner"]
+    if fetch_node_by_slug(graph, loser_slug) is not None:
+        _refuse_json(graph, f"a node with slug '{loser_slug}' exists again — cannot restore")
+    loser_props = dict(state["props"])
+    keys = sorted(loser_props)
+    assignments = ", ".join(f"n.{k} = $v_{k}" for k in keys)
+    params = {f"v_{k}": loser_props[k] for k in keys}
+    with managed_tx(graph):
+        run_query(
+            graph, f"CREATE (n:{state['label']}) SET {assignments}", parameters=params
+        )
+        winner = fetch_node_by_slug(graph, winner_slug)
+        if winner is not None:
+            wprops = winner.get("properties", {})
+            aliases = [str(a) for a in _as_list(wprops.get("alias"))]
+            if loser_slug in aliases:
+                aliases = [a for a in aliases if a != loser_slug]
+                if dprops.get("winnerAliasForm") == "string" and len(aliases) == 1:
+                    # The winner's alias was a scalar before the merge; restore
+                    # the scalar form, not the one-element list merge made of it.
+                    apply_props(
+                        graph, "MATCH (n {slug: $slug})", {"slug": winner_slug},
+                        {"alias": aliases[0]},
+                    )
+                elif aliases:
+                    apply_props(
+                        graph, "MATCH (n {slug: $slug})", {"slug": winner_slug},
+                        {"alias": aliases},
+                    )
+                else:
+                    run_query(
+                        graph,
+                        "MATCH (n {slug: $slug}) REMOVE n.alias",
+                        parameters={"slug": winner_slug},
+                    )
+        restored, skipped = 0, []
+        for record in state["edges"]:
+            frm, to, etype = record["from"], record["to"], record["type"]
+            if fetch_node_by_slug(graph, frm) is None or fetch_node_by_slug(graph, to) is None:
+                skipped.append({"from": frm, "to": to, "type": etype})
+                continue
+            _create_edge(graph, frm, etype, to, record.get("props") or {})
+            restored += 1
+            if not record.get("mergedIntoExisting"):
+                new_from = winner_slug if frm == loser_slug else frm
+                new_to = winner_slug if to == loser_slug else to
+                _, ev = run_query(
+                    graph,
+                    f"MATCH (a {{slug: $from}})-[r:{etype}]->(b {{slug: $to}}) "
+                    "RETURN elementId(r) AS eid",
+                    parameters={"from": new_from, "to": new_to},
+                )
+                if ev:
+                    run_query(
+                        graph,
+                        "MATCH ()-[r]->() WHERE elementId(r) = $eid DELETE r",
+                        parameters={"eid": ev[0][0]},
+                    )
+        stamp = now_utc()
+        apply_props(
+            graph, "MATCH (n:Decision {slug: $slug})", {"slug": decision_id},
+            {"revertedAt": stamp},
+        )
+        unmerge_decision = logged_decision(
+            graph, f"unmerge restoring '{loser_slug}' from decision {decision_id}",
+            "unmerge", decision_id,
+            {"restored": loser_slug, "winner": winner_slug},
+            link_slug=loser_slug,
+        )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "decision": decision_id,
+            "unmergeDecision": unmerge_decision,
+            "restored": loser_slug,
+            "edgesRestored": restored,
+            "edgesSkipped": skipped,
+            "revertedAt": stamp,
+        }
+    )
+
+
+def cmd_log_decision(args):
+    graph = resolve_graph(args[0])
+    kind, subject = args[1], args[2]
+    try:
+        detail = json.loads(args[3])
+    except json.JSONDecodeError:
+        fail("detail must be valid JSON", code=2)
+    slug = write_decision(graph, kind, subject, detail)
+    print_json(
+        {"graph": graph["slug"], "id": slug, "kind": kind,
+         "subject": subject, "detail": detail}
+    )
+
+
+def _ledger_entries(graph, kind_filter=None):
+    entries = []
+    for node in fetch_nodes(graph, "Decision"):
+        props = node.get("properties", {})
+        if kind_filter and props.get("kind") != kind_filter:
+            continue
+        detail = props.get("detail")
+        try:
+            detail = json.loads(detail) if detail else None
+        except json.JSONDecodeError:
+            pass
+        entries.append(
+            {
+                "id": props.get("slug"),
+                "kind": props.get("kind"),
+                "subject": props.get("subject"),
+                "detail": detail,
+                "at": props.get("at"),
+                "revertedAt": props.get("revertedAt"),
+            }
+        )
+    return entries
+
+
+def _parse_ledger_flags(rest, usage):
+    """--kind K / --since ISO / --limit N / --newest-first, any order."""
+    kind_filter, since, limit, newest = None, None, None, False
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("--kind", "--since", "--limit") and i + 1 < len(rest):
+            value = rest[i + 1]
+            if tok == "--kind":
+                kind_filter = value
+            elif tok == "--since":
+                since = value
+            else:
+                try:
+                    limit = int(value)
+                except ValueError:
+                    fail("--limit must be an integer", code=2)
+                if limit < 1:
+                    fail("--limit must be >= 1", code=2)
+            i += 2
+        elif tok == "--newest-first":
+            newest = True
+            i += 1
+        else:
+            fail(usage, code=2)
+    return kind_filter, since, limit, newest
+
+
+def cmd_decisions(args):
+    graph = resolve_graph(args[0])
+    kind_filter, since, limit, newest = _parse_ledger_flags(
+        args[1:],
+        "usage: relate decisions <graph> [--kind K] [--since ISO] "
+        "[--limit N] [--newest-first]",
+    )
+    entries = _ledger_entries(graph, kind_filter)
+    if since:
+        entries = [e for e in entries if (e["at"] or "") >= since]
+    entries.sort(key=lambda e: ((e["at"] or ""), e["id"] or ""))
+    if newest:
+        entries.reverse()
+    total = len(entries)
+    if limit is not None:
+        entries = entries[:limit]
+    print_json(
+        {
+            "graph": graph["slug"],
+            "decisions": entries,
+            "count": len(entries),
+            "total": total,
+            "filters": {
+                "kind": kind_filter, "since": since, "limit": limit,
+                "order": "newest-first" if newest else "oldest-first",
+            },
+        }
+    )
+
+
+def _decision_summary(kind, subject):
+    """Deterministic one-line summary from kind+subject only — no LLM text."""
+    s = subject or ""
+    if kind == "merge":
+        return f"merged {s}"
+    if kind == "unmerge":
+        return f"reverted merge recorded in {s}"
+    if kind == "supersede":
+        return f"superseded fact on {s}"
+    if kind == "resolve":
+        return f"resolved review item {s}"
+    if kind == "stamp":
+        return f"stamped ontology {s}"
+    if kind == "reconcile":
+        return f"reconciled duplicate ontology terms in {s}"
+    if kind == "contest":
+        return f"marked contested: {s}"
+    return f"{kind}: {s}"
+
+
+def cmd_changes(args):
+    graph = resolve_graph(args[0])
+    usage = "usage: relate changes <graph> [--since ISO] [--limit N]"
+    kind_filter, since, limit, _newest = _parse_ledger_flags(args[1:], usage)
+    if kind_filter is not None:
+        fail(usage, code=2)
+    changes = [
+        {
+            "id": e["id"], "kind": e["kind"], "subject": e["subject"],
+            "at": e["at"],
+            "summary": _decision_summary(e["kind"], e["subject"]),
+        }
+        for e in _ledger_entries(graph)
+    ]
+    if since:
+        changes = [c for c in changes if (c["at"] or "") >= since]
+    changes.sort(key=lambda c: ((c["at"] or ""), c["id"] or ""), reverse=True)
+    total = len(changes)
+    if limit is not None:
+        changes = changes[:limit]
+    print_json(
+        {"graph": graph["slug"], "changes": changes,
+         "count": len(changes), "total": total}
+    )
+
+
+REVIEW_KINDS = {"duplicate", "conflict", "low-confidence"}
+
+
+def _review_item_view(props):
+    view = dict(props)
+    for key in ("subject", "choices"):
+        raw = view.get(key)
+        if isinstance(raw, str):
+            try:
+                view[key] = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+    return view
+
+
+def cmd_review_add(args):
+    graph = resolve_graph(args[0])
+    kind = args[1]
+    if kind not in REVIEW_KINDS:
+        fail(
+            f"review kind must be one of {sorted(REVIEW_KINDS)}", code=2
+        )
+    try:
+        subject = json.loads(args[2])
+        choices = json.loads(args[3])
+    except json.JSONDecodeError:
+        fail("subject and choices must be valid JSON", code=2)
+    stamp = now_utc()
+    props = {
+        "kind": kind,
+        "subject": json.dumps(subject, default=str),
+        "choices": json.dumps(choices, default=str),
+        "status": "open", "at": stamp,
+    }
+    keys = sorted(props)
+    assignments = ", ".join(f"n.{k} = $v_{k}" for k in keys)
+    params = {f"v_{k}": props[k] for k in keys}
+    # Slug allocated inside the create statement, with the same
+    # collision-renumber guard as write_decision (this engine does not
+    # serialize count+create across concurrent statements).
+    _, created = run_query(
+        graph,
+        "MATCH (r:ReviewItem) WITH count(r) AS c "
+        "CREATE (n:ReviewItem) SET n.slug = 'review-' + "
+        "(CASE WHEN c < 9 THEN '000' WHEN c < 99 THEN '00' "
+        "WHEN c < 999 THEN '0' ELSE '' END) + toString(c + 1), "
+        f"{assignments} RETURN n.slug AS slug, elementId(n) AS eid",
+        parameters=params,
+    )
+    slug, eid = created[0][0], created[0][1]
+    _, dup = run_query(
+        graph,
+        "MATCH (r:ReviewItem {slug: $slug}) RETURN count(r) AS c",
+        parameters={"slug": slug},
+    )
+    if dup[0][0] > 1:
+        tail = re.sub(r"[^A-Za-z0-9]", "", str(eid))[-8:] or "x"
+        slug = f"{slug}-{tail}"
+        run_query(
+            graph,
+            "MATCH (n) WHERE elementId(n) = $eid SET n.slug = $slug",
+            parameters={"eid": eid, "slug": slug},
+        )
+    print_json(
+        {
+            "graph": graph["slug"], "id": slug, "kind": kind,
+            "subject": subject, "choices": choices,
+            "status": "open", "at": stamp,
+        }
+    )
+
+
+def cmd_review_list(args):
+    graph = resolve_graph(args[0])
+    items = []
+    for node in fetch_nodes(graph, "ReviewItem"):
+        props = node.get("properties", {})
+        if props.get("status") == "open":
+            items.append(_review_item_view(props))
+    items.sort(key=lambda p: p.get("slug") or "")
+    print_json({"graph": graph["slug"], "items": items})
+
+
+def cmd_review_resolve(args):
+    graph = resolve_graph(args[0])
+    item_id, choice = args[1], args[2]
+    node = fetch_node_by_slug(graph, item_id)
+    if node is None or "ReviewItem" not in node.get("labels", []):
+        fail(f"no review item with id '{item_id}' in graph '{graph['slug']}'", code=3)
+    props = node.get("properties", {})
+    if props.get("status") != "open":
+        _refuse_json(graph, f"review item '{item_id}' is already {props.get('status')}")
+    try:
+        choices = json.loads(props.get("choices") or "[]")
+    except json.JSONDecodeError:
+        choices = []
+    valid = set()
+    if isinstance(choices, list):
+        for entry in choices:
+            if isinstance(entry, str):
+                valid.add(entry)
+            elif isinstance(entry, dict):
+                for key in ("id", "choice", "value"):
+                    if entry.get(key):
+                        valid.add(str(entry[key]))
+    if valid and choice not in valid:
+        _refuse_json(
+            graph, f"choice '{choice}' is not one of the item's choices {sorted(valid)}"
+        )
+    stamp = now_utc()
+    with managed_tx(graph):
+        apply_props(
+            graph, "MATCH (n:ReviewItem {slug: $slug})", {"slug": item_id},
+            {"status": "resolved", "resolution": choice, "resolvedAt": stamp},
+        )
+        decision = logged_decision(
+            graph, f"resolution of review item '{item_id}'",
+            "resolve", item_id,
+            {"choice": choice, "reviewKind": props.get("kind")},
+            link_slug=item_id,
+        )
+    updated = fetch_node_by_slug(graph, item_id)
+    print_json(
+        {
+            "graph": graph["slug"],
+            "decision": decision,
+            "item": _review_item_view(updated.get("properties", {})),
+        }
+    )
+
+
+def cmd_embed_edges(args):
+    graph = resolve_graph(args[0])
+    _, hv = run_query(
+        graph,
+        "MATCH ()-[r]->() WHERE r.fact IS NOT NULL "
+        "AND r.fact_embedding IS NOT NULL "
+        "AND r.fact_embedding_format = $format RETURN count(r) AS c",
+        parameters={"format": EMBED_FORMAT_EDGE},
+    )
+    already = hv[0][0]
+    _, nv = run_query(
+        graph, "MATCH ()-[r]->() WHERE r.fact IS NULL RETURN count(r) AS c"
+    )
+    no_fact = nv[0][0]
+    _, values = run_query(
+        graph,
+        "MATCH (a)-[r]->(b) WHERE r.fact IS NOT NULL "
+        "AND (r.fact_embedding IS NULL OR r.fact_embedding_format IS NULL "
+        "OR r.fact_embedding_format <> $format) "
+        "RETURN a.slug AS fa, type(r) AS t, b.slug AS fb, r.fact AS fact",
+        parameters={"format": EMBED_FORMAT_EDGE},
+    )
+    embedded, failed = 0, []
+    if values:
+        ensure_ollama()
+    stamp = resolved_model_stamp()
+    for fa, etype, fb, fact in values:
+        try:
+            if not fa or not fb:
+                raise ValueError("edge endpoint has no slug")
+            vec = embed_text(EMBED_SYM_PREFIX + str(fact))
+            if len(vec) != EMBED_DIM:
+                raise ValueError(
+                    f"embedding has {len(vec)} dims, expected {EMBED_DIM}"
+                )
+            run_query(
+                graph,
+                f"MATCH (a {{slug: $fa}})-[r:{etype}]->(b {{slug: $fb}}) "
+                "WHERE r.fact = $fact SET r.fact_embedding = $vec, "
+                "r.fact_embedding_dim = $dim, r.fact_embedding_model = $model, "
+                "r.fact_embedding_format = $format",
+                parameters={
+                    "fa": fa, "fb": fb, "fact": fact, "vec": vec,
+                    "dim": EMBED_DIM, "model": stamp, "format": EMBED_FORMAT_EDGE,
+                },
+            )
+            embedded += 1
+        except Exception as exc:  # per-edge failure is data, not a crash
+            failed.append(
+                {"from": fa, "type": etype, "to": fb, "error": str(exc)}
+            )
+    print_json(
+        {
+            "graph": graph["slug"],
+            "embedded": embedded,
+            "alreadyHad": already,
+            "noFact": no_fact,
+            "model": stamp,
+            "format": EMBED_FORMAT_EDGE,
+            "failed": failed,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Triplet extraction (Cognee steals #1/#2): deterministic chunking + the
+# extraction contract + a validating converter that hands the extracted
+# KnowledgeGraph to write-batch. The LLM work (filling the contract)
+# stays in the pipeline's reasoning stage; everything mechanical —
+# chunk boundaries, contract validation, slug identity, the write —
+# is fixed code here.
+# ---------------------------------------------------------------------------
+
+EXTRACTION_CONTRACT = {
+    "schema": {
+        "nodes": [
+            {"name": "<most complete name>", "type": "<elementary type>",
+             "description": "<what the text says about this entity>"}
+        ],
+        "edges": [
+            {"source": "<endpoint name>", "target": "<endpoint name>",
+             "relationship": "<snake_case verb>",
+             "fact": "<concrete one-sentence fact expressed by this edge, "
+                     "using endpoint names>"}
+        ],
+    },
+    "rules": [
+        "Nodes represent entities and concepts; edges represent "
+        "relationships between them. Extract BOTH — a chunk that yields "
+        "entities but no relationships is an incomplete extraction.",
+        "Elementary types only: a person is \"Person\", never "
+        "\"Mathematician\" or \"Scientist\" — profession and role go in "
+        "the description. Types must be classes stamped in the target "
+        "graph's ontology.",
+        "Every node carries the most complete human-readable name found "
+        "in the text. Coreference: when an entity is mentioned several "
+        "times under different names or pronouns, always use the most "
+        "complete identifier.",
+        "Relationship names are snake_case verbs (works_for, owns, "
+        "leads). They map to the object properties stamped in the "
+        "target graph's ontology (upper-snake form).",
+        "Every edge MUST carry its fact: a concrete one-sentence fact "
+        "expressed by the edge, using the endpoint names, dry and "
+        "efficient, with qualifiers from the source text where they "
+        "matter. Good: \"Alice works at Acme as a platform engineer on "
+        "the search team.\" Bad: \"This edge describes an employment "
+        "relationship.\" An edge without a fact is invalid and the "
+        "whole extraction is refused.",
+        "Do not add outside knowledge. Numbers, counts, amounts and "
+        "dates stay inside descriptions and facts — they never become "
+        "nodes of their own.",
+        "Keep only the time precision the text states; never invent "
+        "missing parts of a date.",
+    ],
+}
+
+DEFAULT_CHUNK_SIZE = 4000
+
+
+def chunk_text(text, size=DEFAULT_CHUNK_SIZE):
+    """Paragraph-based chunker (Cognee TextChunker shape): paragraphs
+    accumulate up to `size` chars; an oversized paragraph splits on
+    sentence boundaries, then on hard windows. Deterministic; every
+    chunk carries its char offsets in the source."""
+    paragraphs = []
+    pos = 0
+    for part in re.split(r"(\n\s*\n)", text):
+        if part.strip():
+            paragraphs.append((pos, part))
+        pos += len(part)
+    units = []  # (start, text) — paragraphs or sentence splits
+    for start, para in paragraphs:
+        if len(para) <= size:
+            units.append((start, para))
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        offset = start
+        for sent in sentences:
+            if len(sent) > size:
+                for i in range(0, len(sent), size):
+                    units.append((offset + i, sent[i:i + size]))
+            else:
+                units.append((offset, sent))
+            offset += len(sent) + 1
+    chunks = []
+    current, current_start = [], None
+    for start, unit in units:
+        unit = unit.strip()
+        if not unit:
+            continue
+        if current and sum(len(u) for u in current) + len(unit) + 2 > size:
+            joined = "\n\n".join(current)
+            chunks.append({
+                "index": len(chunks), "text": joined,
+                "charStart": current_start,
+                "charEnd": current_start + len(joined),
+            })
+            current, current_start = [], None
+        if current_start is None:
+            current_start = start
+        current.append(unit)
+    if current:
+        joined = "\n\n".join(current)
+        chunks.append({
+            "index": len(chunks), "text": joined,
+            "charStart": current_start,
+            "charEnd": current_start + len(joined),
+        })
+    return chunks
+
+
+def cmd_chunks(args):
+    size = DEFAULT_CHUNK_SIZE
+    rest = list(args)
+    if "--size" in rest:
+        idx = rest.index("--size")
+        try:
+            size = int(rest[idx + 1])
+        except (IndexError, ValueError):
+            fail("usage: relate chunks <file> [--size N]", code=2)
+        del rest[idx:idx + 2]
+    if len(rest) != 1:
+        fail("usage: relate chunks <file> [--size N]", code=2)
+    try:
+        with open(rest[0], encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        fail(f"source file not found: {rest[0]}", code=2)
+    print_json({
+        "source": rest[0],
+        "chunkSize": size,
+        "chunks": chunk_text(text, size),
+        "contract": EXTRACTION_CONTRACT,
+    })
+
+
+def cmd_extract(args):
+    graph = resolve_graph(args[0])
+    try:
+        with open(args[1], encoding="utf-8") as handle:
+            extraction = json.load(handle)
+    except FileNotFoundError:
+        fail(f"extraction file not found: {args[1]}", code=2)
+    except json.JSONDecodeError as exc:
+        fail(f"extraction file {args[1]} is not valid JSON: {exc}", code=2)
+    source = extraction.get("source") or {}
+    source_slug = source.get("slug")
+    source_path = source.get("path")
+    class_names, obj_props, _ = stamped_terms(graph)
+    invalid = []
+
+    nodes_by_slug = {}
+    for raw in extraction.get("nodes") or []:
+        name = (raw.get("name") or "").strip()
+        ntype = raw.get("type") or ""
+        if not name:
+            invalid.append({"node": raw, "reason": "node has no name"})
+            continue
+        if ntype not in class_names:
+            invalid.append({
+                "node": raw,
+                "reason": f"type '{ntype}' is not stamped in the graph's ontology",
+            })
+            continue
+        slug = identity_slug(name)
+        props = {"name": name}
+        if raw.get("description"):
+            props["summary"] = raw["description"]
+        # Provenance for an extracted ENTITY is the accumulating
+        # `sources` list, never a single sourcePath: the same entity
+        # legitimately arrives from many documents, and sourcePath is
+        # single-valued (a second document would read as a conflict).
+        # The SourceDocument node itself keeps its own sourcePath.
+        if source_slug:
+            props["sources"] = [source_slug]
+        live = fetch_node_by_slug(graph, slug)
+        if live is not None:
+            live_props = live.get("properties", {})
+            prior_sources = live_props.get("sources") or []
+            if isinstance(prior_sources, str):
+                prior_sources = [prior_sources]
+            merged = list(prior_sources)
+            for s in props.get("sources", []):
+                if s not in merged:
+                    merged.append(s)
+            if merged:
+                props["sources"] = merged
+            if live_props.get("summary"):
+                # First summary stands until a summarize/consolidation
+                # pass improves it — a later extraction never silently
+                # overwrites it.
+                props.pop("summary", None)
+        prior = nodes_by_slug.get(slug)
+        if prior is None:
+            nodes_by_slug[slug] = {"slug": slug, "label": ntype, "props": props}
+        elif not prior["props"].get("summary") and props.get("summary"):
+            prior["props"]["summary"] = props["summary"]
+
+    def resolve_endpoint(name):
+        slug = identity_slug(str(name))
+        if slug in nodes_by_slug:
+            return slug
+        if fetch_node_by_slug(graph, slug) is not None:
+            return slug
+        return None
+
+    batch_edges = []
+    for raw in extraction.get("edges") or []:
+        rel = (raw.get("relationship") or "").strip()
+        etype = re.sub(r"\s+", "_", rel).upper()
+        fact = (raw.get("fact") or raw.get("description") or "").strip()
+        desc = {"source": raw.get("source"), "target": raw.get("target"),
+                "relationship": rel}
+        if etype not in obj_props:
+            invalid.append({
+                "edge": desc,
+                "reason": f"relationship '{rel}' (-> {etype}) is not a stamped object property in the graph's ontology",
+            })
+            continue
+        if not fact:
+            invalid.append({
+                "edge": desc,
+                "reason": "edge carries no fact — the contract requires a concrete one-sentence fact using endpoint names",
+            })
+            continue
+        frm = resolve_endpoint(raw.get("source"))
+        to = resolve_endpoint(raw.get("target"))
+        if frm is None or to is None:
+            invalid.append({
+                "edge": desc,
+                "reason": "endpoint does not resolve to an extracted node or an existing graph node",
+            })
+            continue
+        eprops = {"fact": fact}
+        if source_path:
+            eprops["sourcePath"] = source_path
+        if source_slug:
+            eprops["sourceSlug"] = source_slug
+        batch_edges.append({"from": frm, "to": to, "type": etype, "props": eprops})
+
+    if invalid:
+        print_json({
+            "graph": graph["slug"], "applied": {"nodes": 0, "edges": 0},
+            "invalid": invalid,
+        })
+        sys.exit(1)
+
+    batch_nodes = list(nodes_by_slug.values())
+    if source_slug:
+        if source_slug not in nodes_by_slug \
+                and fetch_node_by_slug(graph, source_slug) is None:
+            batch_nodes.append({
+                "slug": source_slug, "label": "SourceDocument",
+                "props": {
+                    "name": source.get("name") or source_slug,
+                    "sourcePath": source_path or source_slug,
+                },
+            })
+        for slug in nodes_by_slug:
+            if slug != source_slug:
+                batch_edges.append({
+                    "from": source_slug, "to": slug, "type": "MENTIONS",
+                    "props": {"sourcePath": source_path or source_slug},
+                })
+    result = apply_batch(graph, batch_nodes, batch_edges)
+    print_json({
+        "graph": graph["slug"],
+        "source": {"slug": source_slug, "path": source_path},
+        "extracted": {
+            "nodes": len(nodes_by_slug), "factEdges": len(batch_edges),
+        },
+        "invalid": [],
+        **result,
+    })
+
+
+def _subject_slugs(raw, live_slugs):
+    """Every string inside a ReviewItem subject JSON that names a live
+    node — the deterministic involvement test for the memify pass."""
+    found = set()
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return found
+
+    def walk(value):
+        if isinstance(value, str):
+            if value in live_slugs:
+                found.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+
+    walk(parsed)
+    return found
+
+
+def cmd_memify(args):
+    """Memify lite (Cognee steal #5, scoped): recompute feedback_weight
+    / importance_weight from the graph's own usage signals and store
+    them where they differ. STATE-BASED, not incremental — the weights
+    are a pure function of the current signals, so re-running the pass
+    is a no-op (idempotent) and the numbers are always explainable:
+
+      feedback_weight(node)   = min(1, 0.5 + 0.10 x resolved review
+                                items whose subject names the node)
+      importance_weight(node) = min(1, 0.5 + 0.05 x Question ABOUT
+                                edges targeting the node — the answers
+                                the answering loop actually used)
+      feedback_weight(edge)   = min(1, 0.5 + 0.10 x resolved items
+                                naming BOTH endpoints)   [fact edges]
+      importance_weight(edge) = mean of its endpoints' importance
+
+    Defaults are 0.5 (the triplet scorer's neutral point); only
+    weights that differ from the stored value are written."""
+    dry_run = "--dry-run" in args
+    rest = [a for a in args if a != "--dry-run"]
+    if len(rest) != 1:
+        fail("usage: relate memify <graph> [--dry-run]", code=2)
+    graph = resolve_graph(rest[0])
+
+    _, sv = run_query(graph, "MATCH (n) WHERE n.slug IS NOT NULL RETURN n.slug")
+    live_slugs = {row[0] for row in sv}
+
+    _, rv = run_query(
+        graph,
+        "MATCH (r:ReviewItem) WHERE r.status = 'resolved' RETURN r.subject",
+    )
+    review_counts = {}
+    for (subject,) in rv:
+        for slug in _subject_slugs(subject, live_slugs):
+            review_counts[slug] = review_counts.get(slug, 0) + 1
+
+    _, qv = run_query(
+        graph,
+        "MATCH (q:Question)-[:ABOUT]->(n) WHERE n.slug IS NOT NULL "
+        "RETURN n.slug, count(*) AS c",
+    )
+    question_hits = {row[0]: row[1] for row in qv}
+
+    def node_weights(slug):
+        fw = min(1.0, 0.5 + 0.10 * review_counts.get(slug, 0))
+        iw = min(1.0, 0.5 + 0.05 * question_hits.get(slug, 0))
+        return round(fw, 4), round(iw, 4)
+
+    _, nv = run_query(
+        graph,
+        "MATCH (n) WHERE n.slug IS NOT NULL "
+        "RETURN n.slug, n.feedback_weight, n.importance_weight",
+    )
+    node_updates = []
+    importance = {}
+    for slug, fw, iw in nv:
+        if slug not in live_slugs:
+            continue
+        new_fw, new_iw = node_weights(slug)
+        importance[slug] = new_iw
+        if fw != new_fw or iw != new_iw:
+            if (fw is None and new_fw == 0.5) and (iw is None and new_iw == 0.5):
+                continue  # default on a signal-free node: leave it bare
+            node_updates.append((slug, new_fw, new_iw))
+
+    _, ev = run_query(
+        graph,
+        "MATCH (a)-[r]->(b) WHERE r.fact IS NOT NULL "
+        "RETURN a.slug, b.slug, r.feedback_weight, r.importance_weight",
+    )
+    edge_updates = []
+    seen_pairs = set()
+    for fa, fb, fw, iw in ev:
+        pair_key = (fa, fb)
+        both = sum(
+            1 for (subject,) in rv
+            if fa in _subject_slugs(subject, live_slugs)
+            and fb in _subject_slugs(subject, live_slugs)
+        )
+        new_fw = round(min(1.0, 0.5 + 0.10 * both), 4)
+        new_iw = round(
+            (importance.get(fa, 0.5) + importance.get(fb, 0.5)) / 2.0, 4
+        )
+        if fw != new_fw or iw != new_iw:
+            if (fw is None and new_fw == 0.5) and (iw is None and new_iw == 0.5):
+                continue
+            if pair_key not in seen_pairs:
+                edge_updates.append((fa, fb, new_fw, new_iw))
+                seen_pairs.add(pair_key)
+
+    if not dry_run:
+        for slug, new_fw, new_iw in node_updates:
+            run_query(
+                graph,
+                "MATCH (n {slug: $slug}) SET n.feedback_weight = $fw, "
+                "n.importance_weight = $iw",
+                parameters={"slug": slug, "fw": new_fw, "iw": new_iw},
+            )
+        for fa, fb, new_fw, new_iw in edge_updates:
+            run_query(
+                graph,
+                "MATCH (a {slug: $fa})-[r]->(b {slug: $fb}) "
+                "WHERE r.fact IS NOT NULL SET r.feedback_weight = $fw, "
+                "r.importance_weight = $iw",
+                parameters={"fa": fa, "fb": fb, "fw": new_fw, "iw": new_iw},
+            )
+    print_json({
+        "graph": graph["slug"],
+        "dryRun": dry_run,
+        "signals": {
+            "resolvedReviewItems": len(rv),
+            "questionAboutHits": sum(question_hits.values()),
+        },
+        "updated": {"nodes": len(node_updates), "edges": len(edge_updates)},
+        "nodeWeights": [
+            {"slug": s, "feedback_weight": f, "importance_weight": i}
+            for s, f, i in node_updates
+        ],
+        "edgeWeights": [
+            {"from": a, "to": b, "feedback_weight": f, "importance_weight": i}
+            for a, b, f, i in edge_updates
+        ],
+    })
+
+
+USAGE = """usage: relate <command> [args]
+
+Commands:
+  graphs                      list every registered graph (slug, port, apiBase, status, service)
+  status                      every graph plus a live API check (reachable, node count)
+  counts <graph>              node and edge counts for one graph
+  labels <graph>              node-label counts for one graph
+  types <graph>               relationship-type counts for one graph
+  node <graph> <slug>         one node by its slug property, with neighbor count and list
+  query <graph> <cypher>      run a raw Cypher query and print rows as JSON (escape hatch)
+  signals <graph>             list SpaceSignal nodes (empty list when the label does not exist yet)
+  provision <slug>            provision a new graph with the house provisioning script
+
+Deterministic tool layer (fixed code, JSON in/out, no judgment):
+  stamp <graph> <vocab>       materialize an ontology into the graph, keyed by term name
+                              <vocab>: house, foaf, prov-o, owl-time, skos, dcterms, org, schema-org
+  reconcile <graph>           merge duplicate OntologyClass/OntologyProperty bookkeeping by name
+  scan-conflicts <graph>      read-only conflict scan (duplicate terms/slugs, contested,
+                              single-value, conflicting edges, identity conflicts)
+  embed-missing <graph> [--force]
+                              embed every content node that lacks an embedding
+                              (embeddinggemma-2, document format); --force re-embeds
+                              every content node in the current model + format
+  verify <graph>              run the full deterministic gate suite (20 gates)
+  write-batch <graph> <file>  the sanctioned write path for extracted data (each item checked
+                              against the live graph's stamped ontology + provenance before
+                              it applies, MERGE on slug; a refused item never partially applies)
+  normalize-scan <graph>      read-only normalization candidate pairs by fixed rules
+  categorize <graph>          apply the ontology's deterministic category rules, list residue
+  clean-scan <graph>          read-only findings (duplicate/self edges, isolated, undeclared types)
+  vocab <graph>               read-only vocabulary discovery (skill §2): ranked term counts
+                              from node name/summary/category + edge fact sentences, each
+                              term marked covered/uncovered by the stamped ontology
+  communities <graph>         deterministic label propagation, writes the community property
+  supersede <graph> <ref> <file>
+                              retire-and-link one decided correction (fact-ref is JSON:
+                              {slug, property} or {from, to, type}); refuses anything undecidable
+  similar <graph> <threshold> content-node pairs at raw cosine >= threshold, written as
+                              lead-grade SIMILAR_TO edges (explicit jobs only, never dream)
+  similar-scan <graph> <threshold>
+                              read-only twin of similar: the same pairs, nothing written
+  rename <graph> <kind> <old> <new>
+                              rename an ontology class/property term and its conforming references
+  merge <graph> <winner> <loser> <basis-json>
+                              merge loser into winner; full pre-merge state stored on a
+                              Decision node so the merge is reversible with unmerge
+  unmerge <graph> <decision-id>
+                              restore the loser node and its edges from a merge Decision
+  log-decision <graph> <kind> <subject> <detail-json>
+                              append one entry to the Decision ledger
+  decisions <graph> [--kind K] [--since ISO] [--limit N] [--newest-first]
+                              list Decision ledger entries (oldest first by default;
+                              --since filters on the entry timestamp, inclusive)
+  changes <graph> [--since ISO] [--limit N]
+                              the changes feed: Decision entries newest-first, each
+                              with a deterministic one-line summary from kind+subject
+  review-add <graph> <kind> <subject-json> <choices-json>
+                              open a ReviewItem (kind: duplicate, conflict, low-confidence)
+  review-list <graph>         list open ReviewItems
+  review-resolve <graph> <id> <choice>
+                              resolve a ReviewItem with one of its choices (logs a Decision)
+  embed-edges <graph>         embed edge `fact` sentences into fact_embedding on the edge
+  ddl <graph>                 apply the engine schema DDL (slug UNIQUE constraints +
+                              slug indexes, per-label VECTOR INDEX, FULLTEXT INDEX);
+                              idempotent — creates only what is missing. Also runs
+                              as part of stamp and at provision time
+  ddl --api-base <url>        same, against an unregistered API base (provisioning)
+  chunks <file> [--size N]    deterministic paragraph chunker for extraction: prints
+                              the chunks (with char offsets) plus the extraction
+                              contract (Cognee KnowledgeGraph schema + prompt rules)
+  memify <graph> [--dry-run]  recompute feedback_weight / importance_weight from the
+                              graph's usage signals (resolved review items, Question
+                              ABOUT hits) — state-based and idempotent; the weights
+                              feed triplet-mode ranking in relate-search
+  extract <graph> <file>      validate an extraction produced under that contract
+                              (elementary stamped types, snake_case relationships
+                              mapped to stamped properties, a one-sentence fact on
+                              every edge, endpoints resolving), convert it with
+                              identity-by-construction slugs, and apply it through
+                              write-batch; any contract violation refuses the whole
+                              extraction with the violations listed
+
+<graph> is a registry slug such as main or test-graph. Run `relate graphs` to list them.
+"""
+
+COMMANDS = {
+    "graphs": (cmd_graphs, 0),
+    "status": (cmd_status, 0),
+    "counts": (cmd_counts, 1),
+    "labels": (cmd_labels, 1),
+    "types": (cmd_types, 1),
+    "node": (cmd_node, 2),
+    "query": (cmd_query, 2),
+    "signals": (cmd_signals, 1),
+    "provision": (cmd_provision, 1),
+    "stamp": (cmd_stamp, 2),
+    "reconcile": (cmd_reconcile, 1),
+    "scan-conflicts": (cmd_scan_conflicts, 1),
+    "embed-missing": (cmd_embed_missing, None),
+    "verify": (cmd_verify, 1),
+    "write-batch": (cmd_write_batch, 2),
+    "normalize-scan": (cmd_normalize_scan, 1),
+    "categorize": (cmd_categorize, 1),
+    "clean-scan": (cmd_clean_scan, 1),
+    "vocab": (cmd_vocab, 1),
+    "communities": (cmd_communities, 1),
+    "supersede": (cmd_supersede, 3),
+    "similar": (cmd_similar, 2),
+    "similar-scan": (cmd_similar_scan, 2),
+    "rename": (cmd_rename, 4),
+    "merge": (cmd_merge, 4),
+    "unmerge": (cmd_unmerge, 2),
+    "log-decision": (cmd_log_decision, 4),
+    "decisions": (cmd_decisions, None),
+    "changes": (cmd_changes, None),
+    "review-add": (cmd_review_add, 4),
+    "review-list": (cmd_review_list, 1),
+    "review-resolve": (cmd_review_resolve, 3),
+    "embed-edges": (cmd_embed_edges, 1),
+    "ddl": (cmd_ddl, None),
+    "chunks": (cmd_chunks, None),
+    "extract": (cmd_extract, 2),
+    "memify": (cmd_memify, None),
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    name = argv[1]
+    if name not in COMMANDS:
+        print(f"error: unknown command '{name}'\n\n{USAGE}", file=sys.stderr)
+        return 2
+    handler, arity = COMMANDS[name]
+    args = argv[2:]
+    if arity is not None and len(args) != arity:
+        print(f"error: '{name}' expects {arity} argument(s), got {len(args)}\n\n{USAGE}", file=sys.stderr)
+        return 2
+    handler(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

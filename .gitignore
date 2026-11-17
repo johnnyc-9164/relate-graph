@@ -1,0 +1,18 @@
+# Graph data and runtime state — never published
+*.rl
+*.db
+app.db
+registry.json
+*.lock
+
+# Build output and dependencies
+node_modules/
+dist/
+dist-cvm/
+__pycache__/
+.tsbuildinfo*
+.harness/
+
+# Machine-local config
+*.env
+logs/

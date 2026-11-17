@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""relate-eval — deterministic answer-evaluation harness for the Relate graphs.
+
+Lane 4 of the beyond-Utopia/Graphiti swarm (2026-11-17). Implements NVIDIA
+adoption #1 (auto-ontology-eval pattern) bent to our rails:
+
+  - The same questions are executed against the answering path twice:
+      Arm A (control)   : plain `relate-search` (hybrid RRF, no rerank).
+      Arm B (treatment) : `relate-search --rerank`, plus `--triplets` for
+                          relational questions (the GraphRAG machinery).
+  - Scoring is deterministic execution comparison — NO LLM judge anywhere.
+    Every check is an executed test against the tool output:
+      * expected slug present in top-k (rank recorded),
+      * expected fact substring present in the retrieved corpus (the arm's
+        result names/slugs + the summaries of its top-5 retrieved nodes,
+        read back through `relate node` — the answering loop's read step),
+      * expected edge (type -> target) carried by one of the arm's top-10
+        retrieved nodes (arm B may also satisfy it from a triplet line),
+      * absence questions pass only when the arm returns an empty result
+        set (the grounded "that's not in this graph" behavior).
+  - Output is the aggregate score per arm plus the per-question
+    fixed / broke lists, so the delta is auditable question by question.
+
+This grades the ANSWERING path, not the graph: `relate verify` already
+proves graph integrity; nothing else measured whether retrieval surfaces
+the right node, the right fact, and silence on absent topics.
+
+READ-ONLY: the harness only ever runs relate-search and `relate node`.
+It writes nothing to any graph. Reports land in the eval folder.
+
+Usage:
+  relate-eval [graph] [--questions PATH] [--outdir DIR] [--limit N]
+
+Exit codes: 0 = run completed (pass rate is reported, never encoded in
+the exit code), 1 = harness could not execute (search tool failed on
+every question), 2 = usage error.
+"""
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RELATE = HERE / "relate"
+RELATE_SEARCH = HERE / "relate-search"
+DEFAULT_QUESTIONS = Path.home() / "workspace" / "relate-space" / "eval" / "questions.json"
+DEFAULT_OUTDIR = Path.home() / "workspace" / "relate-space" / "eval"
+FACT_CORPUS_TOP = 5    # summaries of the arm's top-N hits form the fact corpus
+EDGE_SCAN_TOP = 10     # edge checks scan the arm's top-N hits' neighbor lists
+TOOL_TIMEOUT = 180
+
+
+def run_json(cmd):
+    """Run a tool, return (parsed_json_or_None, error_string)."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=TOOL_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"timeout after {TOOL_TIMEOUT}s: {' '.join(cmd)}"
+    except OSError as exc:
+        return None, f"cannot execute {cmd[0]}: {exc}"
+    if proc.returncode != 0:
+        return None, f"exit {proc.returncode}: {(proc.stderr or proc.stdout)[:300]}"
+    try:
+        return json.loads(proc.stdout), ""
+    except json.JSONDecodeError:
+        return None, f"non-JSON output: {proc.stdout[:300]}"
+
+
+class NodeCache:
+    """relate node reads, cached across arms and questions."""
+
+    def __init__(self, graph):
+        self.graph = graph
+        self.cache = {}
+
+    def get(self, slug):
+        if slug not in self.cache:
+            data, err = run_json([str(RELATE), "node", self.graph, slug])
+            if err or not data:
+                self.cache[slug] = {"summary": "", "neighbors": []}
+            else:
+                props = data.get("properties", {}) or {}
+                self.cache[slug] = {
+                    "summary": props.get("summary") or "",
+                    "neighbors": data.get("neighbors", []) or [],
+                }
+        return self.cache[slug]
+
+
+def search(graph, question, limit, *flags):
+    cmd = [str(RELATE_SEARCH), graph, question, "--limit", str(limit), *flags]
+    data, err = run_json(cmd)
+    if err:
+        return [], err
+    return data.get("results", []) or [], ""
+
+
+def triplet_lines(results):
+    """Render triplet-mode results defensively (shape varies by build)."""
+    lines = []
+    for entry in results:
+        if isinstance(entry, dict):
+            lines.append(json.dumps(entry, sort_keys=True))
+        else:
+            lines.append(str(entry))
+    return lines
+
+
+def edge_in_triplets(results, edge):
+    etype = edge["type"]
+    eto = edge["to"]
+    for entry in results:
+        if isinstance(entry, dict):
+            typ = entry.get("type") or entry.get("rel") or entry.get("relationship")
+            to = entry.get("to") or entry.get("target") or entry.get("toSlug")
+            frm = entry.get("from") or entry.get("source") or entry.get("fromSlug")
+            if typ == etype and to == eto:
+                return frm or "?"
+            blob = json.dumps(entry)
+            if etype in blob and eto in blob:
+                return frm or "?"
+        elif etype in str(entry) and eto in str(entry):
+            return "?"
+    return None
+
+
+def evaluate_question(q, graph, limit, nodes):
+    """Run both arms for one question; return the per-question record."""
+    kind = q.get("kind", "entity")
+    question = q["question"]
+
+    a_results, a_err = search(graph, question, limit)
+    b_results, b_err = search(graph, question, limit, "--rerank")
+    b_triplets, b_trip_err = ([], "")
+    if kind == "relational":
+        b_triplets, b_trip_err = search(graph, question, limit, "--triplets")
+
+    def corpus(results):
+        parts = []
+        for r in results:
+            parts.append(str(r.get("name", "")))
+            parts.append(str(r.get("slug", "")))
+        for r in results[:FACT_CORPUS_TOP]:
+            slug = r.get("slug")
+            if slug:
+                parts.append(nodes.get(slug)["summary"])
+        return "\n".join(parts).lower()
+
+    def edge_found(results, extra_triplets):
+        edge = q["expectEdge"]
+        for r in results[:EDGE_SCAN_TOP]:
+            slug = r.get("slug")
+            if not slug:
+                continue
+            for nb in nodes.get(slug)["neighbors"]:
+                if nb.get("rel") == edge["type"] and nb.get("slug") == edge["to"]:
+                    return slug
+        if extra_triplets:
+            return edge_in_triplets(extra_triplets, edge)
+        return None
+
+    def run_checks(results, tool_err, triplets, trip_err):
+        checks = []
+        if q.get("expectAbsent"):
+            ok = not tool_err and len(results) == 0
+            detail = "empty result set" if ok else f"{len(results)} results"
+            if triplets or trip_err:
+                tok = not trip_err and len(triplets) == 0
+                ok = ok and tok
+                detail += f"; triplets {'empty' if tok else 'non-empty/error'}"
+            if tool_err:
+                detail = f"tool error: {tool_err}"
+            checks.append({"check": "absent", "pass": bool(ok), "detail": detail})
+            return checks
+        for exp in q.get("expectSlugs", []):
+            slug, topk = exp["slug"], exp["topK"]
+            rank = next(
+                (i + 1 for i, r in enumerate(results) if r.get("slug") == slug),
+                None,
+            )
+            ok = rank is not None and rank <= topk
+            checks.append({
+                "check": f"slug:{slug}@{topk}",
+                "pass": bool(ok),
+                "detail": f"rank {rank}" if rank else "not retrieved",
+            })
+        if q.get("expectFacts"):
+            corp = corpus(results)
+            for fact in q["expectFacts"]:
+                ok = fact.lower() in corp
+                checks.append({
+                    "check": f"fact:{fact}",
+                    "pass": bool(ok),
+                    "detail": "in retrieved corpus" if ok else "not in retrieved corpus",
+                })
+        if q.get("expectEdge"):
+            found = edge_found(results, triplets)
+            checks.append({
+                "check": f"edge:{q['expectEdge']['type']}->{q['expectEdge']['to']}",
+                "pass": found is not None,
+                "detail": f"via {found}" if found else "no retrieved node carries it",
+            })
+        if tool_err:
+            for c in checks:
+                c["pass"] = False
+                c["detail"] = f"tool error: {tool_err}"
+        return checks
+
+    a_checks = run_checks(a_results, a_err, [], "")
+    b_checks = run_checks(b_results, b_err, b_triplets, b_trip_err)
+
+    def summarize(checks):
+        total = len(checks)
+        passed = sum(1 for c in checks if c["pass"])
+        return {
+            "checks": checks,
+            "passed": passed,
+            "total": total,
+            "score": (passed / total) if total else 1.0,
+            "pass": total > 0 and passed == total,
+        }
+
+    return {
+        "id": q["id"],
+        "question": question,
+        "kind": kind,
+        "armA": summarize(a_checks),
+        "armB": summarize(b_checks),
+        "armA_top": [r.get("slug") for r in a_results[:5]],
+        "armB_top": [r.get("slug") for r in b_results[:5]],
+    }
+
+
+def main(argv):
+    graph = None
+    questions_path = DEFAULT_QUESTIONS
+    outdir = DEFAULT_OUTDIR
+    limit = 15
+    args = list(argv)
+    while args:
+        a = args.pop(0)
+        if a == "--questions":
+            questions_path = Path(args.pop(0))
+        elif a == "--outdir":
+            outdir = Path(args.pop(0))
+        elif a == "--limit":
+            limit = int(args.pop(0))
+        elif a.startswith("--"):
+            print(__doc__)
+            return 2
+        elif graph is None:
+            graph = a
+        else:
+            print(__doc__)
+            return 2
+
+    spec = json.loads(questions_path.read_text())
+    graph = graph or spec.get("graph", "main")
+    questions = spec["questions"]
+    nodes = NodeCache(graph)
+
+    records = [evaluate_question(q, graph, limit, nodes) for q in questions]
+
+    tool_dead = all(
+        r["armA"]["total"] > 0
+        and all("tool error" in c["detail"] for c in r["armA"]["checks"])
+        and all("tool error" in c["detail"] for c in r["armB"]["checks"])
+        for r in records
+    )
+
+    def agg(key):
+        scores = [r[key]["score"] for r in records]
+        return {
+            "meanScore": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "questionsPassed": sum(1 for r in records if r[key]["pass"]),
+            "questionsTotal": len(records),
+            "checksPassed": sum(r[key]["passed"] for r in records),
+            "checksTotal": sum(r[key]["total"] for r in records),
+        }
+
+    fixed = [r["id"] for r in records if not r["armA"]["pass"] and r["armB"]["pass"]]
+    broke = [r["id"] for r in records if r["armA"]["pass"] and not r["armB"]["pass"]]
+    both_fail = [r["id"] for r in records if not r["armA"]["pass"] and not r["armB"]["pass"]]
+    both_pass = [r["id"] for r in records if r["armA"]["pass"] and r["armB"]["pass"]]
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report = {
+        "harness": "relate-eval v1",
+        "graph": graph,
+        "ranAt": stamp,
+        "questionSet": str(questions_path),
+        "questionCount": len(records),
+        "arms": {
+            "A": "relate-search (plain hybrid RRF)",
+            "B": "relate-search --rerank (+ --triplets for relational questions)",
+        },
+        "aggregate": {"A": agg("armA"), "B": agg("armB")},
+        "fixedByB": fixed,
+        "brokeByB": broke,
+        "passingBoth": both_pass,
+        "failingBoth": both_fail,
+        "questions": records,
+    }
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    json_path = outdir / f"eval-{stamp}.json"
+    md_path = outdir / f"eval-{stamp}.md"
+    json_path.write_text(json.dumps(report, indent=2))
+
+    lines = [
+        f"# relate-eval report — graph `{graph}` — {stamp}",
+        "",
+        "Deterministic answer evaluation (NVIDIA adoption #1): same questions, "
+        "two retrieval arms, executed checks only — no LLM judge.",
+        "",
+        f"- Arm A (control): {report['arms']['A']}",
+        f"- Arm B (treatment): {report['arms']['B']}",
+        "",
+        "| Arm | Questions passed | Mean question score | Checks passed |",
+        "| --- | --- | --- | --- |",
+        f"| A | {report['aggregate']['A']['questionsPassed']}/{len(records)} | "
+        f"{report['aggregate']['A']['meanScore']:.2%} | "
+        f"{report['aggregate']['A']['checksPassed']}/{report['aggregate']['A']['checksTotal']} |",
+        f"| B | {report['aggregate']['B']['questionsPassed']}/{len(records)} | "
+        f"{report['aggregate']['B']['meanScore']:.2%} | "
+        f"{report['aggregate']['B']['checksPassed']}/{report['aggregate']['B']['checksTotal']} |",
+        "",
+        f"**Fixed by B** (failed A, passed B): {', '.join(fixed) or 'none'}",
+        f"**Broke by B** (passed A, failed B): {', '.join(broke) or 'none'}",
+        f"**Failing both arms** (standing gaps): {', '.join(both_fail) or 'none'}",
+        "",
+        "## Per-question results",
+        "",
+    ]
+    for r in records:
+        lines.append(f"### {r['id']} — “{r['question']}” ({r['kind']})")
+        lines.append("")
+        for arm_key, label in (("armA", "A"), ("armB", "B")):
+            arm = r[arm_key]
+            verdict = "PASS" if arm["pass"] else "FAIL"
+            lines.append(f"- Arm {label}: {verdict} ({arm['passed']}/{arm['total']} checks)")
+            for c in arm["checks"]:
+                mark = "ok" if c["pass"] else "MISS"
+                lines.append(f"  - [{mark}] {c['check']} — {c['detail']}")
+        lines.append(f"- A top-5: {', '.join(x or '?' for x in r['armA_top']) or 'empty'}")
+        lines.append(f"- B top-5: {', '.join(x or '?' for x in r['armB_top']) or 'empty'}")
+        lines.append("")
+    md_path.write_text("\n".join(lines))
+
+    print(json.dumps({
+        "report": str(json_path),
+        "markdown": str(md_path),
+        "aggregate": report["aggregate"],
+        "fixedByB": fixed,
+        "brokeByB": broke,
+        "failingBoth": both_fail,
+    }, indent=2))
+    return 1 if tool_dead else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

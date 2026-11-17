@@ -1,0 +1,6 @@
+id: "custom.relate"
+title: "Relate"
+description: "Use Relate by Neo4j local graphs through their HTTP Query API: list graphs, check live status, read node and edge counts, label and relationship-type breakdowns, node lookups, SpaceSignal reads, and raw Cypher against the user's own local graph data. No credential: the APIs bind to loopback only."
+include_in_prompt: true
+require_auth: false
+aliases: ["Relate by Neo4j", "Relate Graph", "Relate DB"]
